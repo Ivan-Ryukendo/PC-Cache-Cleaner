@@ -194,13 +194,16 @@ $form=New-Object System.Windows.Forms.Form
 $form.Text='Clean PC - choose what to delete'
 $form.StartPosition='CenterScreen'; $form.Width=720; $form.Height=620; $form.MinimumSize=New-Object System.Drawing.Size(640,520)
 
-# Build all controls, then add them in dock z-order: Fill control MUST be added
-# LAST so docked Top/Bottom controls reserve their space first and nothing overlaps.
+# Header lives in its own docked Top panel so it can never overlap the list.
+$headerPanel=New-Object System.Windows.Forms.Panel; $headerPanel.Dock='Top'; $headerPanel.Height=44
 $header=New-Object System.Windows.Forms.Label
 $header.Text="Tick the items you want to delete, then press 'Clean Selected'. Only safe cache/temp data is listed."
-$header.Dock='Top'; $header.Height=40; $header.Padding=New-Object System.Windows.Forms.Padding(10,10,10,0)
+$header.Dock='Fill'; $header.TextAlign='MiddleLeft'; $header.Padding=New-Object System.Windows.Forms.Padding(10,0,10,0)
 $header.Font=New-Object System.Drawing.Font('Segoe UI',9)
+$headerPanel.Controls.Add($header)
 
+# ListView lives in its own Fill panel with top padding -> guaranteed gap below header.
+$lvHost=New-Object System.Windows.Forms.Panel; $lvHost.Dock='Fill'; $lvHost.Padding=New-Object System.Windows.Forms.Padding(0,4,0,0)
 $lv=New-Object System.Windows.Forms.ListView
 $lv.View='Details'; $lv.CheckBoxes=$true; $lv.FullRowSelect=$true; $lv.GridLines=$true
 $lv.Dock='Fill'; $lv.Font=New-Object System.Drawing.Font('Segoe UI',9)
@@ -218,13 +221,15 @@ foreach($t in ($targets | Sort-Object @{e='Category'},@{e='Size';Descending=$tru
     $it.Tag=$t
     $lv.Items.Add($it)|Out-Null
 }
+$lvHost.Controls.Add($lv)
 
 $panel=New-Object System.Windows.Forms.Panel; $panel.Dock='Bottom'; $panel.Height=90
 
-# Dock z-order: add Bottom + Top first, Fill (ListView) LAST so it fills the gap.
+# WinForms dock resolves by z-order: the Fill control must be added FIRST
+# (lowest z-order), then the Top/Bottom panels, so Fill takes the leftover space.
+$form.Controls.Add($lvHost)
+$form.Controls.Add($headerPanel)
 $form.Controls.Add($panel)
-$form.Controls.Add($header)
-$form.Controls.Add($lv)
 
 $lblTotal=New-Object System.Windows.Forms.Label
 $lblTotal.AutoSize=$false; $lblTotal.Dock='Top'; $lblTotal.Height=28

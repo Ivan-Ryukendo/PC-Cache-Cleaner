@@ -1,9 +1,11 @@
 # Built artifact — distributed via GitHub Releases, not committed to source
 CleanPC.exe
 
-# Runtime logs written next to the app
+# Runtime logs written next to the app (never upload these)
 CleanPC-log.txt
 CleanPC-log.old
+*.log
+CleanPC-log*
 
 # Local design/working notes (not shipped to end users)
 DESIGN-exe-and-logging.md
