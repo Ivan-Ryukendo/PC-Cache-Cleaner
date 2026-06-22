@@ -73,7 +73,17 @@ Any change to the codebase must preserve this contract.
   enumerator. Avoid measuring a folder twice — that was the original slowness.
 - **Change the UI layout / buttons:** the WinForms window is built at the
   bottom of `CleanPC-GUI.ps1` (splash form, ListView, buttons, the
-  `Clean Selected` click handler).
+  `Clean Selected` click handler). **Dock z-order gotcha:** docked controls
+  must be added to `$form.Controls` with `Top`/`Bottom` panels FIRST and the
+  `Fill` ListView LAST, or the header overlaps the first row. The `Cancel`
+  button (`$btnCancel`) is hidden until cleaning starts and shares the `Close`
+  button's slot; it sets `$script:cancelRequested`, which the clean loop checks
+  between items (stops cleanly, never mid-delete).
+- **Build the shareable EXE:** `Invoke-PS2EXE .\CleanPC-GUI.ps1 .\CleanPC.exe
+  -requireAdmin -noConsole -title "PC Cache Cleaner"` (needs `Install-Module
+  ps2exe`). `-requireAdmin` bakes in the UAC prompt, so the exe replaces
+  `CleanPC.bat` for end users. The exe is distributed via GitHub Releases, not
+  committed (see `.gitignore`).
 - **Make the launcher use the console version by default:** swap the active
   and commented `powershell` lines near the end of `CleanPC.bat`.
 
@@ -88,3 +98,9 @@ Any change to the codebase must preserve this contract.
 - Always test new cache paths with `-DryRun` (console) before a real run.
 - The whole folder is portable: keep `CleanPC.bat` and both `.ps1` files
   together when copying to another PC.
+- Both scripts write `CleanPC-log.txt` next to the exe/script (rolling the
+  prior run to `CleanPC-log.old`) via the `Write-CleanLog` helper. The empty
+  `catch {}` blocks at each `Remove-Item` now log `SKIP <file>: <reason>` so
+  locked-file skips are visible; a script-scope `trap` logs crashes. The
+  logging helper must never throw — keep its own `try/catch`. Update both
+  scripts' logging in lockstep, same as the cleanup list.

@@ -194,11 +194,12 @@ $form=New-Object System.Windows.Forms.Form
 $form.Text='Clean PC - choose what to delete'
 $form.StartPosition='CenterScreen'; $form.Width=720; $form.Height=620; $form.MinimumSize=New-Object System.Drawing.Size(640,520)
 
+# Build all controls, then add them in dock z-order: Fill control MUST be added
+# LAST so docked Top/Bottom controls reserve their space first and nothing overlaps.
 $header=New-Object System.Windows.Forms.Label
 $header.Text="Tick the items you want to delete, then press 'Clean Selected'. Only safe cache/temp data is listed."
 $header.Dock='Top'; $header.Height=40; $header.Padding=New-Object System.Windows.Forms.Padding(10,10,10,0)
 $header.Font=New-Object System.Drawing.Font('Segoe UI',9)
-$form.Controls.Add($header)
 
 $lv=New-Object System.Windows.Forms.ListView
 $lv.View='Details'; $lv.CheckBoxes=$true; $lv.FullRowSelect=$true; $lv.GridLines=$true
@@ -217,10 +218,13 @@ foreach($t in ($targets | Sort-Object @{e='Category'},@{e='Size';Descending=$tru
     $it.Tag=$t
     $lv.Items.Add($it)|Out-Null
 }
-$form.Controls.Add($lv)
 
 $panel=New-Object System.Windows.Forms.Panel; $panel.Dock='Bottom'; $panel.Height=90
+
+# Dock z-order: add Bottom + Top first, Fill (ListView) LAST so it fills the gap.
 $form.Controls.Add($panel)
+$form.Controls.Add($header)
+$form.Controls.Add($lv)
 
 $lblTotal=New-Object System.Windows.Forms.Label
 $lblTotal.AutoSize=$false; $lblTotal.Dock='Top'; $lblTotal.Height=28
@@ -248,9 +252,13 @@ $btnClean=New-Object System.Windows.Forms.Button; $btnClean.Text='Clean Selected
 $btnClean.Font=New-Object System.Drawing.Font('Segoe UI',9,[System.Drawing.FontStyle]::Bold)
 $btnClose=New-Object System.Windows.Forms.Button; $btnClose.Text='Close'; $btnClose.Width=90; $btnClose.Height=34; $btnClose.Top=44
 $btnClose.Add_Click({ $form.Close() })
-$panel.Controls.AddRange(@($btnAll,$btnNone,$btnClean,$btnClose))
-$panel.Add_Resize({ $btnClose.Left=$panel.Width-104; $btnClean.Left=$panel.Width-252 })
-$btnClose.Left=$form.Width-120; $btnClean.Left=$form.Width-268
+# Cancel: only visible while cleaning; sets a flag the loop checks between items.
+$script:cancelRequested=$false
+$btnCancel=New-Object System.Windows.Forms.Button; $btnCancel.Text='Cancel'; $btnCancel.Width=90; $btnCancel.Height=34; $btnCancel.Top=44; $btnCancel.Visible=$false
+$btnCancel.Add_Click({ $script:cancelRequested=$true; $btnCancel.Enabled=$false; $status.Text='Cancelling after current item...' })
+$panel.Controls.AddRange(@($btnAll,$btnNone,$btnClean,$btnClose,$btnCancel))
+$panel.Add_Resize({ $btnClose.Left=$panel.Width-104; $btnCancel.Left=$panel.Width-104; $btnClean.Left=$panel.Width-252 })
+$btnClose.Left=$form.Width-120; $btnCancel.Left=$form.Width-120; $btnClean.Left=$form.Width-268
 
 $btnClean.Add_Click({
     $chosen=@(); foreach($i in $lv.Items){ if($i.Checked){ $chosen += $i } }
@@ -261,8 +269,10 @@ $btnClean.Add_Click({
         if($r -eq 'Cancel'){ return }
     }
     $btnClean.Enabled=$false; $btnAll.Enabled=$false; $btnNone.Enabled=$false
-    $freed=[int64]0; $n=0
+    $script:cancelRequested=$false; $btnCancel.Enabled=$true; $btnCancel.Visible=$true; $btnClose.Visible=$false
+    $freed=[int64]0; $n=0; $cancelled=$false
     foreach($i in $chosen){
+        if($script:cancelRequested){ $cancelled=$true; Write-CleanLog "=== CANCELLED by user ==="; break }
         $n++; $status.Text="Cleaning ($n/$($chosen.Count)): $($i.Tag.Name)"; $status.Refresh(); [System.Windows.Forms.Application]::DoEvents()
         $before=[int64]$i.Tag.Size
         Invoke-Clean $i.Tag
@@ -273,10 +283,12 @@ $btnClean.Add_Click({
         $i.SubItems[1].Text = (Format-Size $after)
         $i.Checked=$false
     }
-    $status.Text="Done."
+    $btnCancel.Visible=$false; $btnClose.Visible=$true
+    $status.Text= if($cancelled){"Cancelled."}else{"Done."}
     Write-CleanLog ("=== TOTAL FREED {0} ===" -f (Format-Size $freed))
     $cFree=(Get-PSDrive C -EA SilentlyContinue).Free
-    [System.Windows.Forms.MessageBox]::Show(("Freed about {0}.`nC: free space is now {1}." -f (Format-Size $freed),(Format-Size $cFree)),"Cleanup complete",'OK','Information')|Out-Null
+    $msg = if($cancelled){"Cancelled. Freed about {0} before stopping.`nC: free space is now {1}."}else{"Freed about {0}.`nC: free space is now {1}."}
+    [System.Windows.Forms.MessageBox]::Show(($msg -f (Format-Size $freed),(Format-Size $cFree)),"Cleanup complete",'OK','Information')|Out-Null
     $btnClean.Enabled=$true; $btnAll.Enabled=$true; $btnNone.Enabled=$true
     Update-Total
 })

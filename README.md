@@ -18,7 +18,9 @@ data**. Download one file, run it, tick what to clear, done.
 2. Double-click it. Windows asks for administrator permission (needed to clear
    system temp and the Windows Update cache) — click **Yes**.
 3. It scans your PC, then shows a checklist with each item's size. Tick what you
-   want, press **Clean Selected**, and it reports how much space it freed.
+   want, press **Clean Selected**, and it reports how much space it freed. You
+   can press **Cancel** mid-run to stop after the current item (already-freed
+   space is kept; nothing is left half-deleted).
 
 ### "Windows protected your PC" on first run
 
