@@ -1,0 +1,12 @@
+# Built artifact — distributed via GitHub Releases, not committed to source
+CleanPC.exe
+
+# Runtime logs written next to the app
+CleanPC-log.txt
+CleanPC-log.old
+
+# Local design/working notes (not shipped to end users)
+DESIGN-exe-and-logging.md
+
+# Agent/session artifacts
+.claude/
