@@ -1,7 +1,7 @@
 # PC Cache Cleaner
 
 <p align="center">
-  <img src="icon.png" width="130" alt="PC Cache Cleaner icon">
+  <img src="assets/icon.png" width="130" alt="PC Cache Cleaner icon">
 </p>
 
 A portable Windows 10/11 cache & temp cleaner. It auto-detects what your PC has
@@ -27,7 +27,7 @@ data**. Download one file, run it, tick what to clear, done.
    space is kept; nothing is left half-deleted).
 
 <p align="center">
-  <img src="Screenshot.jpg" alt="PC Cache Cleaner screenshot" width="580">
+  <img src="assets/Screenshot.jpg" alt="PC Cache Cleaner screenshot" width="580">
 </p>
 
 ### "Windows protected your PC" on first run

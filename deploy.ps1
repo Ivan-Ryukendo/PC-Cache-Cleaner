@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 # --- 1. Convert icon.png -> icon.ico (proper Vista ICO: ICONDIR + embedded PNG) ---
 Write-Host "Converting icon.png to icon.ico..." -ForegroundColor Cyan
 Add-Type -AssemblyName System.Drawing
-$srcImg = [System.Drawing.Image]::FromFile((Resolve-Path '.\icon.png').Path)
+$srcImg = [System.Drawing.Image]::FromFile((Resolve-Path '.\assets\icon.png').Path)
 $bmp    = New-Object System.Drawing.Bitmap(256, 256)
 $g      = [System.Drawing.Graphics]::FromImage($bmp)
 $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
@@ -28,7 +28,7 @@ $pngStream = New-Object System.IO.MemoryStream
 $bmp.Save($pngStream, [System.Drawing.Imaging.ImageFormat]::Png)
 $pngBytes = $pngStream.ToArray()
 $pngStream.Close(); $bmp.Dispose()
-$icoPath = '.\icon.ico'
+$icoPath = '.\assets\icon.ico'
 $w = [System.IO.BinaryWriter]::new([System.IO.File]::Create($icoPath))
 $w.Write([uint16]0); $w.Write([uint16]1); $w.Write([uint16]1)   # ICONDIR header
 $w.Write([byte]0); $w.Write([byte]0); $w.Write([byte]0); $w.Write([byte]0)  # 256x256, no palette
@@ -42,7 +42,7 @@ if (-not (Get-Command Invoke-PS2EXE -ErrorAction SilentlyContinue)) {
     Write-Host "ps2exe not found. Installing..." -ForegroundColor Yellow
     Install-Module ps2exe -Scope CurrentUser -Force
 }
-Invoke-PS2EXE .\CleanPC-GUI.ps1 .\CleanPC.exe `
+Invoke-PS2EXE .\src\CleanPC-GUI.ps1 .\CleanPC.exe `
     -requireAdmin -noConsole `
     -title "PC Cache Cleaner" `
     -iconFile $icoPath `

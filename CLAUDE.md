@@ -4,15 +4,26 @@ Portable Windows 10/11 cache & temp cleaner. Auto-detects GPU/browser/dev/app
 caches and frees space by deleting **only regenerable cache/temp data**. Shipped
 as one `CleanPC.exe` on GitHub Releases (repo: `Ivan-Ryukendo/PC-Cache-Cleaner`).
 
+## Layout
+
+```
+src/          CleanPC-GUI.ps1, Clean-PC-Cache.ps1, CleanPC.bat
+assets/       icon.png, Screenshot.jpg
+docs/         README.txt
+deploy.ps1    build + release script (run from repo root)
+README.md     GitHub readme
+LICENSE
+```
+
 ## Files
 
-- `CleanPC-GUI.ps1` — GUI (scan → checklist with sizes → Clean Selected). This
+- `src/CleanPC-GUI.ps1` — GUI (scan → checklist with sizes → Clean Selected). This
   is what the `.exe` wraps and the default experience.
-- `Clean-PC-Cache.ps1` — no-UI console version; same cleanup. Flags: `-Auto`,
+- `src/Clean-PC-Cache.ps1` — no-UI console version; same cleanup. Flags: `-Auto`,
   `-DryRun`, `-IncludeRecycleBin`, `-IncludeClaudeVM`, `-SkipDevCaches`.
-- `CleanPC.bat` — legacy launcher (self-elevates, runs the GUI). The `-requireAdmin`
+- `src/CleanPC.bat` — legacy launcher (self-elevates, runs the GUI). The `-requireAdmin`
   exe makes this optional for end users; kept for source runs.
-- `README.md` (GitHub) / `README.txt` (end users). `DESIGN-exe-and-logging.md` —
+- `README.md` (GitHub) / `docs/README.txt` (end users). `DESIGN-exe-and-logging.md` —
   design/decision log (gitignored, local only).
 
 ## Safety contract (never break)
@@ -27,7 +38,7 @@ every item must be visible and tickable.
 
 ```powershell
 Install-Module ps2exe -Scope CurrentUser   # once
-Invoke-PS2EXE .\CleanPC-GUI.ps1 .\CleanPC.exe -requireAdmin -noConsole -title "PC Cache Cleaner"
+Invoke-PS2EXE .\src\CleanPC-GUI.ps1 .\CleanPC.exe -requireAdmin -noConsole -title "PC Cache Cleaner"
 gh release create vX.Y.Z .\CleanPC.exe --title "..." --notes "..."
 ```
 
