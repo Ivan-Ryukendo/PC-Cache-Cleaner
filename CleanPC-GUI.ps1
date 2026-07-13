@@ -173,9 +173,12 @@ trap {
     continue
 }
 Write-CleanLog ("=== Run start (GUI) === admin=$(Is-Admin) os=$([System.Environment]::OSVersion.Version) host=$([System.Environment]::MachineName)")
+$script:appIcon = $null
+try { $script:appIcon = [System.Drawing.Icon]::ExtractAssociatedIcon([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) } catch {}
 $splash = New-Object System.Windows.Forms.Form
 $splash.Text='Scanning'; $splash.FormBorderStyle='FixedDialog'; $splash.StartPosition='CenterScreen'
 $splash.Width=420; $splash.Height=120; $splash.ControlBox=$false; $splash.TopMost=$true
+if ($script:appIcon) { $splash.Icon = $script:appIcon }
 $lblS=New-Object System.Windows.Forms.Label; $lblS.AutoSize=$false; $lblS.Dock='Fill'
 $lblS.TextAlign='MiddleCenter'; $lblS.Text="Scanning your PC for cache files..."; $lblS.Font=New-Object System.Drawing.Font('Segoe UI',10)
 $splash.Controls.Add($lblS); $splash.Show(); $splash.Refresh()
@@ -193,7 +196,7 @@ if(($targets|Measure-Object).Count -eq 0){
 $form=New-Object System.Windows.Forms.Form
 $form.Text='Clean PC - choose what to delete'
 $form.StartPosition='CenterScreen'; $form.Width=720; $form.Height=620; $form.MinimumSize=New-Object System.Drawing.Size(640,520)
-try { $form.Icon=[System.Drawing.Icon]::ExtractAssociatedIcon([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) } catch {}
+if ($script:appIcon) { $form.Icon = $script:appIcon }
 
 # Header lives in its own docked Top panel so it can never overlap the list.
 $headerPanel=New-Object System.Windows.Forms.Panel; $headerPanel.Dock='Top'; $headerPanel.Height=44
@@ -300,4 +303,8 @@ $btnClean.Add_Click({
 })
 
 Update-Total
+$notify = New-Object System.Windows.Forms.NotifyIcon
+if ($script:appIcon) { $notify.Icon = $script:appIcon }
+$notify.Text = 'PC Cache Cleaner'; $notify.Visible = $true
+$form.Add_FormClosed({ $notify.Visible = $false; $notify.Dispose() })
 [void]$form.ShowDialog()

@@ -1,16 +1,15 @@
 <#
   deploy.ps1  -  Build CleanPC.exe and publish a GitHub release.
 
-  Usage:
-    .\deploy.ps1 -Version v1.1.0 -Notes "What changed in this release"
+  Commit and push your changes first, then run:
+    .\deploy.ps1 -Version v1.1.0
 
   Prerequisites:
     Install-Module ps2exe -Scope CurrentUser   # once
     gh auth login                              # once (GitHub CLI)
 #>
 param(
-    [Parameter(Mandatory)][string]$Version,
-    [string]$Notes = ''
+    [Parameter(Mandatory)][string]$Version
 )
 
 Set-StrictMode -Version Latest
@@ -42,17 +41,25 @@ Invoke-PS2EXE .\CleanPC-GUI.ps1 .\CleanPC.exe `
 if (-not (Test-Path '.\CleanPC.exe')) { throw "Build failed: CleanPC.exe not found." }
 Write-Host "Build OK." -ForegroundColor Green
 
-# --- 3. Commit and push ---
-Write-Host "Committing..." -ForegroundColor Cyan
-git add -A
-git commit -m "Release $Version"
-git push
-
-# --- 4. Create the GitHub release ---
+# --- 3. Create the GitHub release ---
 Write-Host "Creating GitHub release $Version..." -ForegroundColor Cyan
-if (-not $Notes) { $Notes = "Bug fixes and icon update." }
-gh release create $Version .\CleanPC.exe `
-    --title "PC Cache Cleaner $Version" `
-    --notes $Notes
+$tag   = $Version
+$title = "PC Cache Cleaner $Version"
+$notes = @"
+## What's new in $Version
+
+- **App icon** -- the broom icon now appears on the EXE file, title bar, taskbar button, and system tray while the app is running
+- **System tray** -- the icon is visible in the notification area for the full duration of a cleaning session
+- **Button fix** -- Select All, Select None, Clean Selected, and Close buttons no longer have clipped borders
+- **README** -- icon and screenshot added so visitors can see the app before downloading
+
+### How to upgrade
+Download ``CleanPC.exe`` from the assets below and replace your old copy. No installer needed.
+
+### Safety reminder
+This app only deletes regenerable cache and temp data. It never touches personal files, browser logins, history, passwords, installed programs, or saved games.
+"@
+
+gh release create $tag .\CleanPC.exe --title $title --notes $notes
 
 Write-Host "Done! Release $Version is live." -ForegroundColor Green
