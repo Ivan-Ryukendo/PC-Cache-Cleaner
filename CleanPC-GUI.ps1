@@ -223,7 +223,7 @@ foreach($t in ($targets | Sort-Object @{e='Category'},@{e='Size';Descending=$tru
 }
 $lvHost.Controls.Add($lv)
 
-$panel=New-Object System.Windows.Forms.Panel; $panel.Dock='Bottom'; $panel.Height=90
+$panel=New-Object System.Windows.Forms.Panel; $panel.Dock='Bottom'; $panel.Height=105
 
 # WinForms dock resolves by z-order: the Fill control must be added FIRST
 # (lowest z-order), then the Top/Bottom panels, so Fill takes the leftover space.
@@ -249,17 +249,17 @@ function Update-Total{
 }
 $lv.Add_ItemChecked({ Update-Total })
 
-$btnAll=New-Object System.Windows.Forms.Button; $btnAll.Text='Select all'; $btnAll.Width=90; $btnAll.Height=30; $btnAll.Left=12; $btnAll.Top=46
+$btnAll=New-Object System.Windows.Forms.Button; $btnAll.Text='Select all'; $btnAll.Width=90; $btnAll.Height=34; $btnAll.Left=12; $btnAll.Top=52
 $btnAll.Add_Click({ foreach($i in $lv.Items){$i.Checked=$true} })
-$btnNone=New-Object System.Windows.Forms.Button; $btnNone.Text='Select none'; $btnNone.Width=90; $btnNone.Height=30; $btnNone.Left=110; $btnNone.Top=46
+$btnNone=New-Object System.Windows.Forms.Button; $btnNone.Text='Select none'; $btnNone.Width=90; $btnNone.Height=34; $btnNone.Left=110; $btnNone.Top=52
 $btnNone.Add_Click({ foreach($i in $lv.Items){$i.Checked=$false} })
-$btnClean=New-Object System.Windows.Forms.Button; $btnClean.Text='Clean Selected'; $btnClean.Width=140; $btnClean.Height=34; $btnClean.Top=44
+$btnClean=New-Object System.Windows.Forms.Button; $btnClean.Text='Clean Selected'; $btnClean.Width=140; $btnClean.Height=34; $btnClean.Top=52
 $btnClean.Font=New-Object System.Drawing.Font('Segoe UI',9,[System.Drawing.FontStyle]::Bold)
-$btnClose=New-Object System.Windows.Forms.Button; $btnClose.Text='Close'; $btnClose.Width=90; $btnClose.Height=34; $btnClose.Top=44
+$btnClose=New-Object System.Windows.Forms.Button; $btnClose.Text='Close'; $btnClose.Width=90; $btnClose.Height=34; $btnClose.Top=52
 $btnClose.Add_Click({ $form.Close() })
 # Cancel: only visible while cleaning; sets a flag the loop checks between items.
 $script:cancelRequested=$false
-$btnCancel=New-Object System.Windows.Forms.Button; $btnCancel.Text='Cancel'; $btnCancel.Width=90; $btnCancel.Height=34; $btnCancel.Top=44; $btnCancel.Visible=$false
+$btnCancel=New-Object System.Windows.Forms.Button; $btnCancel.Text='Cancel'; $btnCancel.Width=90; $btnCancel.Height=34; $btnCancel.Top=52; $btnCancel.Visible=$false
 $btnCancel.Add_Click({ $script:cancelRequested=$true; $btnCancel.Enabled=$false; $status.Text='Cancelling after current item...' })
 $panel.Controls.AddRange(@($btnAll,$btnNone,$btnClean,$btnClose,$btnCancel))
 $panel.Add_Resize({ $btnClose.Left=$panel.Width-104; $btnCancel.Left=$panel.Width-104; $btnClean.Left=$panel.Width-252 })

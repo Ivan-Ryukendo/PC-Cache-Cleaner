@@ -1,5 +1,6 @@
-# Built artifact — distributed via GitHub Releases, not committed to source
+# Built artifacts — distributed via GitHub Releases, not committed to source
 CleanPC.exe
+icon.ico
 
 # Runtime logs written next to the app (never upload these)
 CleanPC-log.txt

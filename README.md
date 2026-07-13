@@ -1,5 +1,9 @@
 # PC Cache Cleaner
 
+<p align="center">
+  <img src="icon.png" width="130" alt="PC Cache Cleaner icon">
+</p>
+
 A portable Windows 10/11 cache & temp cleaner. It auto-detects what your PC has
 — NVIDIA / AMD / Intel GPU caches, any installed browser, dev tools, Electron
 apps — and frees disk space by deleting **only regenerable cache and temp
@@ -21,6 +25,10 @@ data**. Download one file, run it, tick what to clear, done.
    want, press **Clean Selected**, and it reports how much space it freed. You
    can press **Cancel** mid-run to stop after the current item (already-freed
    space is kept; nothing is left half-deleted).
+
+<p align="center">
+  <img src="Screenshot.jpg" alt="PC Cache Cleaner screenshot" width="580">
+</p>
 
 ### "Windows protected your PC" on first run
 
