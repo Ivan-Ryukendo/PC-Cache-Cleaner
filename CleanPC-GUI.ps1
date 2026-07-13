@@ -193,6 +193,7 @@ if(($targets|Measure-Object).Count -eq 0){
 $form=New-Object System.Windows.Forms.Form
 $form.Text='Clean PC - choose what to delete'
 $form.StartPosition='CenterScreen'; $form.Width=720; $form.Height=620; $form.MinimumSize=New-Object System.Drawing.Size(640,520)
+try { $form.Icon=[System.Drawing.Icon]::ExtractAssociatedIcon([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) } catch {}
 
 # Header lives in its own docked Top panel so it can never overlap the list.
 $headerPanel=New-Object System.Windows.Forms.Panel; $headerPanel.Dock='Top'; $headerPanel.Height=44
