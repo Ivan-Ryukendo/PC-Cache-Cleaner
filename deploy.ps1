@@ -15,16 +15,26 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# --- 1. Convert icon.png -> icon.ico (ps2exe needs .ico) ---
+# --- 1. Convert icon.png -> icon.ico (proper Vista ICO: ICONDIR + embedded PNG) ---
 Write-Host "Converting icon.png to icon.ico..." -ForegroundColor Cyan
 Add-Type -AssemblyName System.Drawing
-$png   = [System.Drawing.Bitmap]::new((Resolve-Path '.\icon.png').Path)
-$hicon = $png.GetHicon()
-$ico   = [System.Drawing.Icon]::FromHandle($hicon)
+$srcImg = [System.Drawing.Image]::FromFile((Resolve-Path '.\icon.png').Path)
+$bmp    = New-Object System.Drawing.Bitmap(256, 256)
+$g      = [System.Drawing.Graphics]::FromImage($bmp)
+$g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+$g.DrawImage($srcImg, 0, 0, 256, 256)
+$g.Dispose(); $srcImg.Dispose()
+$pngStream = New-Object System.IO.MemoryStream
+$bmp.Save($pngStream, [System.Drawing.Imaging.ImageFormat]::Png)
+$pngBytes = $pngStream.ToArray()
+$pngStream.Close(); $bmp.Dispose()
 $icoPath = '.\icon.ico'
-$fs    = [System.IO.FileStream]::new($icoPath, [System.IO.FileMode]::Create)
-$ico.Save($fs)
-$fs.Close(); $ico.Dispose(); $png.Dispose()
+$w = [System.IO.BinaryWriter]::new([System.IO.File]::Create($icoPath))
+$w.Write([uint16]0); $w.Write([uint16]1); $w.Write([uint16]1)   # ICONDIR header
+$w.Write([byte]0); $w.Write([byte]0); $w.Write([byte]0); $w.Write([byte]0)  # 256x256, no palette
+$w.Write([uint16]1); $w.Write([uint16]32)                       # 1 plane, 32bpp
+$w.Write([uint32]$pngBytes.Length); $w.Write([uint32]22)        # data size, offset=22
+$w.Write($pngBytes); $w.Close()
 
 # --- 2. Build the exe ---
 Write-Host "Building CleanPC.exe..." -ForegroundColor Cyan
