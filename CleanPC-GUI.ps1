@@ -303,8 +303,4 @@ $btnClean.Add_Click({
 })
 
 Update-Total
-$notify = New-Object System.Windows.Forms.NotifyIcon
-if ($script:appIcon) { $notify.Icon = $script:appIcon }
-$notify.Text = 'PC Cache Cleaner'; $notify.Visible = $true
-$form.Add_FormClosed({ $notify.Visible = $false; $notify.Dispose() })
 [void]$form.ShowDialog()
