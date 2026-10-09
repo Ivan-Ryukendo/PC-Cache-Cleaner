@@ -2,7 +2,7 @@
   deploy.ps1  -  Build CleanPC.exe and publish a GitHub release.
 
   Commit and push your changes first, then run:
-    .\deploy.ps1 -Version v1.1.0
+    .\deploy.ps1 -Version v1.2.0
 
   Prerequisites:
     Install-Module ps2exe -Scope CurrentUser   # once
@@ -58,10 +58,12 @@ $title = "PC Cache Cleaner $Version"
 $notes = @"
 ## What's new in $Version
 
-- **App icon** -- the broom icon now appears on the EXE file, title bar, taskbar button, and system tray while the app is running
-- **System tray** -- the icon is visible in the notification area for the full duration of a cleaning session
-- **Button fix** -- Select All, Select None, Clean Selected, and Close buttons no longer have clipped borders
-- **README** -- icon and screenshot added so visitors can see the app before downloading
+- **Multi-drive scanning** -- tick any fixed local drive (or All drives) to also find temp folders, Thumbs.db, ``*.gid``, __pycache__ and node_modules cache folders; risky patterns (``*.tmp``, ``*.old``, ``*.dmp``, ``*.chk``, found.NNN) are listed unticked. Removable/network/optical drives are never scanned and junctions are never followed.
+- **More junk found** -- Windows Update and Delivery Optimization caches, WER and crash dumps, old CBS logs, NVIDIA App installers, Arduino staging, scoop, Teams caches; Playwright, Gradle and old Codex releases are listed unticked.
+- **Report-only tab** -- big virtual disks (WSA, WSL, Application Guard), shadow copies and installed Node versions with removal instructions; the tool never deletes these.
+- **Other user profiles** -- optional, separate, unticked; each deletion needs the profile name typed.
+- **Security check** -- read-only list of suspicious processes and startup entries plus Defender status. Heuristic only ("suspicious, review"); never kills or deletes anything.
+- **Responsive scan** -- scanning runs on background threads with a Stop scan button.
 
 ### How to upgrade
 Download ``CleanPC.exe`` from the assets below and replace your old copy. No installer needed.
