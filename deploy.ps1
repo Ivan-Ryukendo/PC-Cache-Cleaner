@@ -127,6 +127,11 @@ Download ``CleanPC.exe`` from the assets below and replace your old copy (or use
 This app only deletes regenerable cache and temp data. It never touches personal files, browser logins, history, passwords, installed programs, or saved games.
 "@
 
-gh release create $tag .\CleanPC.exe --title $title --notes $notes
+# notes go through a UTF-8 file: embedded quotes in --notes break native argument passing on Windows PowerShell 5.1
+$notesFile = Join-Path ([System.IO.Path]::GetTempPath()) "cleanpc-notes-$tag.md"
+[System.IO.File]::WriteAllText($notesFile, $notes, (New-Object System.Text.UTF8Encoding($false)))
+try { gh release create $tag .\CleanPC.exe --title $title --notes-file $notesFile }
+finally { Remove-Item $notesFile -Force -ErrorAction SilentlyContinue }
+if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)." }
 
 Write-Host "Done! Release $Version is live." -ForegroundColor Green
