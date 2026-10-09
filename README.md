@@ -93,6 +93,30 @@ location**, shows Windows Defender status and recommends a full Defender scan.
 It is only a heuristic: results mean *suspicious, review*, not "virus". It never
 kills or deletes anything.
 
+### Check for updates, Pro edition, restore point, report export (new in 1.2.1)
+
+- **Check for updates** (button, top right): asks GitHub for newer releases
+  **only when you click it** - no automatic checks, no telemetry. It shows two
+  channels separately: this edition (`CleanPC.exe`) and **Upgrade to Pro (free)**.
+  You can download either to the same folder as the program or to any fixed
+  drive/folder (free space is checked first), with a progress bar and Cancel. The
+  download is saved under a temporary `.part` name, verified (size, and SHA-256
+  when GitHub publishes one) and only then renamed. Nothing is ever run or
+  replaced automatically, and an existing file is never overwritten without
+  asking. Afterwards you are asked *"Do you want to keep the old installer or
+  delete it?"*; Delete only ever removes that one old `.exe` (never a folder),
+  after the program closes or at the next launch of the new version.
+- **Pro edition:** a separate, fuller-featured app developed in its own repo,
+  [`Ivan-Ryukendo/PC-Cache-Cleaner-Pro`](https://github.com/Ivan-Ryukendo/PC-Cache-Cleaner-Pro)
+  (free upgrade). Until it is released the dialog says *"Pro edition not
+  released yet"*. Both editions share the same safety rules and cleanup list.
+- **System Restore point:** optional checkbox (off by default). Windows allows
+  one restore point per 24 hours by default; if one cannot be made (or System
+  Restore is off) you are told and asked whether to clean anyway.
+- **Export report:** saves the scan - items, sizes, ticked state, risk, paths,
+  report-only rows and (if you ran it) security findings - as a self-contained
+  HTML page or a CSV file. Works before cleaning; nothing is deleted by it.
+
 ## What it will never touch
 
 Personal files. Browser tabs, sessions, cookies, logins, history, bookmarks,
@@ -133,14 +157,20 @@ The repo ships the raw PowerShell so you can read, audit, or script it:
   .\Clean-PC-Cache.ps1 -DryRun -AllDrives      # every fixed local drive
   .\Clean-PC-Cache.ps1 -SecurityCheck          # read-only suspicious-process report
   .\Clean-PC-Cache.ps1 -ListProfiles           # list other user profiles (read-only)
+  .\Clean-PC-Cache.ps1 -CheckUpdate            # ask GitHub for newer Standard / Pro releases
+  .\Clean-PC-Cache.ps1 -DryRun -ExportReport C:\temp\scan.html   # .html or .csv
+  .\Clean-PC-Cache.ps1 -RestorePoint           # restore point before cleaning (admin)
   ```
 
 ### Building the EXE yourself
 
 ```powershell
 Install-Module ps2exe -Scope CurrentUser
-Invoke-PS2EXE .\src\CleanPC-GUI.ps1 .\CleanPC.exe -requireAdmin -noConsole -title "PC Cache Cleaner"
+.\deploy.ps1 -Version v1.2.1 -BuildOnly    # icon -> multi-size .ico, build, verify icon + version info
 ```
+
+`deploy.ps1` (without `-BuildOnly`) also creates the GitHub release. Under the hood
+it runs `Invoke-PS2EXE` with `-requireAdmin -noConsole -STA`, the icon and version info.
 
 ---
 

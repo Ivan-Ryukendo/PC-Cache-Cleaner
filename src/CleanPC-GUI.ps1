@@ -1,10 +1,12 @@
 <#
 ================================================================================
-  CleanPC-GUI.ps1  -  Windows 10/11 cache cleaner with a click-to-confirm UI   (v1.2.0)
+  CleanPC-GUI.ps1  -  Windows 10/11 cache cleaner with a click-to-confirm UI   (v1.2.1)
 ================================================================================
   Scans the selected drives for regenerable CACHE / TEMP data, then shows a
   checklist where YOU pick exactly what to delete (each row shows its size).
   Nothing is removed until you press "Clean Selected".
+
+  Extras: Check for updates (click only) | Export report (HTML/CSV) | restore point option
 
   Tabs:  Cleanup | Report only (never deleted) | Other user profiles (opt-in)
          | Security check (read-only report)
@@ -17,7 +19,7 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $ErrorActionPreference = 'SilentlyContinue'
-$script:AppVersion = '1.2.0'
+$script:AppVersion = '1.2.1'
 
 # --- logging setup (next to the exe/script) ---
 $script:LogDir = if ($PSScriptRoot) { $PSScriptRoot } else { [System.AppDomain]::CurrentDomain.BaseDirectory }
@@ -913,6 +915,368 @@ function Get-SecurityReport([scriptblock]$Progress){
     $sorted=@($items | Sort-Object @{e={$order[$_.Severity]}},Type,Name)
     return @{ Items=$sorted; Defender=(Get-DefenderInfo); Stats=[PSCustomObject]@{ Processes=$procs.Count; StartupEntries=$startup.Count; SignedAppDataStartup=$signedAppData } }
 }
+
+# ---------------------------------------------------------------- network helpers (update checker + downloader)
+# Used ONLY when the user asks (button / -CheckUpdate). No telemetry, no automatic calls.
+if (-not ('CleanFetch' -as [type])) {
+Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Threading;
+
+// Small GET on a background thread (short timeouts) so the UI never freezes.
+public class CleanFetch {
+    public volatile bool Done;
+    public int Status;
+    public string Body = "";
+    public string Error = "";
+    public void Start(string url, string ua, int timeoutMs) {
+        Done = false;
+        Thread t = new Thread(delegate() {
+            try {
+                HttpWebRequest rq = (HttpWebRequest)WebRequest.Create(url);
+                rq.UserAgent = ua; rq.Accept = "application/vnd.github+json";
+                rq.Timeout = timeoutMs; rq.ReadWriteTimeout = timeoutMs;
+                using (HttpWebResponse rs = (HttpWebResponse)rq.GetResponse()) {
+                    Status = (int)rs.StatusCode;
+                    using (StreamReader sr = new StreamReader(rs.GetResponseStream(), Encoding.UTF8)) { Body = sr.ReadToEnd(); }
+                }
+            } catch (WebException we) {
+                HttpWebResponse r = we.Response as HttpWebResponse;
+                if (r != null) { Status = (int)r.StatusCode; r.Close(); }
+                Error = we.Message;
+            } catch (Exception e) { Error = e.Message; }
+            Done = true;
+        });
+        t.IsBackground = true; t.Start();
+    }
+}
+
+// File download on a background thread with progress + cancel. Writes to 'dest' (caller passes a .part name).
+public class CleanDownloader {
+    public volatile bool Cancel;
+    public volatile bool Done;
+    public volatile bool Ok;
+    public long Total;
+    public long BytesDone;
+    public string Error = "";
+    public void Start(string url, string ua, string dest, int timeoutMs) {
+        Done = false; Ok = false; BytesDone = 0; Total = 0; Error = "";
+        Thread t = new Thread(delegate() {
+            FileStream fs = null;
+            try {
+                HttpWebRequest rq = (HttpWebRequest)WebRequest.Create(url);
+                rq.UserAgent = ua; rq.Accept = "application/octet-stream";
+                rq.Timeout = timeoutMs; rq.ReadWriteTimeout = timeoutMs; rq.AllowAutoRedirect = true;
+                using (HttpWebResponse rs = (HttpWebResponse)rq.GetResponse()) {
+                    Total = rs.ContentLength;
+                    using (Stream s = rs.GetResponseStream()) {
+                        fs = new FileStream(dest, FileMode.Create, FileAccess.Write, FileShare.None);
+                        byte[] buf = new byte[81920]; int n;
+                        while ((n = s.Read(buf, 0, buf.Length)) > 0) {
+                            if (Cancel) { Error = "cancelled"; break; }
+                            fs.Write(buf, 0, n); BytesDone += n;
+                        }
+                    }
+                }
+                fs.Close(); fs = null;
+                Ok = (!Cancel && Error.Length == 0);
+            } catch (Exception e) { Error = e.Message; }
+            finally { if (fs != null) { try { fs.Close(); } catch (Exception) { } } }
+            Done = true;
+        });
+        t.IsBackground = true; t.Start();
+    }
+}
+'@
+}
+
+# ---------------------------------------------------------------- update checker
+$script:RepoStd  = 'Ivan-Ryukendo/PC-Cache-Cleaner'
+$script:RepoPro  = 'Ivan-Ryukendo/PC-Cache-Cleaner-Pro'
+$script:ApiBase  = 'https://api.github.com/repos/'
+$script:MarkerPath = Join-Path $env:LOCALAPPDATA 'CleanPC\pending-delete.txt'
+
+function Enable-Tls12 { try { [Net.ServicePointManager]::SecurityProtocol = ([Net.ServicePointManager]::SecurityProtocol -bor 3072) } catch {} }
+
+# GET + parse JSON. Never throws. Returns Ok/Status/Data/Message. $Pump (optional) keeps a UI alive while waiting.
+function Invoke-GitHubJson([string]$url,[scriptblock]$Pump,[int]$TimeoutMs=8000){
+    $r=[PSCustomObject]@{ Ok=$false; Status=0; Data=$null; Message='' }
+    try{
+        Enable-Tls12
+        $f=New-Object CleanFetch
+        $f.Start($url,"CleanPC/$script:AppVersion",$TimeoutMs)
+        $sw=[Diagnostics.Stopwatch]::StartNew()
+        while(-not $f.Done){
+            if($Pump){ & $Pump }
+            Start-Sleep -Milliseconds 50
+            if($sw.ElapsedMilliseconds -gt ($TimeoutMs*2+2000)){ break }
+        }
+        if(-not $f.Done){ $r.Message='The request timed out.' }
+        else{
+            $r.Status=[int]$f.Status
+            if($r.Status -eq 200){ try{ $r.Data=($f.Body | ConvertFrom-Json); $r.Ok=$true }catch{ $r.Message='GitHub sent an unexpected reply.' } }
+            elseif($r.Status -eq 404){ $r.Message='Not found (404).' }
+            elseif($r.Status -eq 403 -or $r.Status -eq 429){ $r.Message='GitHub is limiting requests right now. Please try again later.' }
+            elseif($r.Status -gt 0){ $r.Message="GitHub answered with HTTP $($r.Status)." }
+            else{ $r.Message="Could not reach GitHub. Check your internet connection. ($($f.Error))" }
+        }
+    }catch{ $r.Message='The update check failed: ' + $_.Exception.Message }
+    Write-CleanLog ("UPDATE GET {0} -> ok={1} status={2} {3}" -f $url,$r.Ok,$r.Status,$r.Message)
+    return $r
+}
+
+# '1.2' / 'v1.2.1' / 'PC Cache Cleaner v1.2.1-beta' -> [version] 1.2.1 (3+ parts), or $null
+function ConvertTo-AppVersion([string]$s){
+    if(-not $s){ return $null }
+    $m=[regex]::Match($s,'(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?')
+    if(-not $m.Success){ return $null }
+    $p=@($m.Groups[1].Value,$m.Groups[2].Value,$(if($m.Groups[3].Success){$m.Groups[3].Value}else{'0'}))
+    if($m.Groups[4].Success){ $p += $m.Groups[4].Value }
+    try{ return [version]($p -join '.') }catch{ return $null }
+}
+
+# State: Newer | UpToDate | Available (Pro) | NotReleased | Error.  Never throws.
+function Get-UpdateInfo([string]$Channel,[string]$Repo,[string]$AssetName,[string]$CurrentVersion,[scriptblock]$Pump,[string]$ApiUrl){
+    $o=[PSCustomObject]@{ Channel=$Channel; State='Error'; Message=''; Tag=''; Version=$null; Notes=''; PageUrl=''; AssetName=$AssetName; AssetUrl=''; AssetSize=[int64]0; AssetSha256=''; Current=$CurrentVersion }
+    try{
+        if(-not $ApiUrl){ $ApiUrl = "$($script:ApiBase)$Repo/releases/latest" }
+        $r=Invoke-GitHubJson $ApiUrl $Pump
+        if($r.Status -eq 404){ $o.State='NotReleased'; $o.Message='No release has been published yet.'; return $o }
+        if(-not $r.Ok){ $o.Message=$r.Message; return $o }
+        $d=$r.Data
+        if($d.draft -or $d.prerelease){ $o.State='NotReleased'; $o.Message='Only a pre-release exists so far.'; return $o }
+        $o.Tag=[string]$d.tag_name; $o.PageUrl=[string]$d.html_url
+        $o.Version=ConvertTo-AppVersion $o.Tag
+        if(-not $o.Version){ $o.Message="Could not read the version number from the release tag '$($o.Tag)'."; return $o }
+        $n=[string]$d.body; if($n.Length -gt 700){ $n=$n.Substring(0,700).TrimEnd()+' ...' }
+        $o.Notes=($n -replace "`r","").Trim()
+        foreach($a in @($d.assets)){
+            if($a.name -ieq $AssetName){
+                $o.AssetUrl=[string]$a.browser_download_url; $o.AssetSize=[int64]$a.size
+                if($a.digest -and ([string]$a.digest) -match '^sha256:([0-9a-fA-F]{64})$'){ $o.AssetSha256=$Matches[1].ToLower() }
+            }
+        }
+        if($Channel -eq 'Pro'){
+            if(-not $o.AssetUrl){ $o.State='NotReleased'; $o.Message="The Pro release has no $AssetName file attached yet."; return $o }
+            $o.State='Available'; return $o
+        }
+        $cur=ConvertTo-AppVersion $CurrentVersion
+        if($cur -and $o.Version -gt $cur){ $o.State='Newer'; if(-not $o.AssetUrl){ $o.Message="The release has no $AssetName file attached; open the release page instead." } }
+        else{ $o.State='UpToDate' }
+    }catch{ $o.State='Error'; $o.Message='The update check failed: ' + $_.Exception.Message }
+    return $o
+}
+function Get-AllUpdateInfo([scriptblock]$Pump){
+    Write-CleanLog "UPDATE CHECK requested by user (current v$script:AppVersion)"
+    $std=Get-UpdateInfo 'Standard' $script:RepoStd 'CleanPC.exe' $script:AppVersion $Pump
+    $pro=Get-UpdateInfo 'Pro' $script:RepoPro 'CleanPC-Pro.exe' '' $Pump
+    Write-CleanLog ("UPDATE RESULT standard={0} ({1}) pro={2} ({3})" -f $std.State,$std.Tag,$pro.State,$pro.Tag)
+    return @{ Standard=$std; Pro=$pro }
+}
+
+# ---------------------------------------------------------------- download + installer housekeeping
+function Get-SelfPath{
+    try{ $p=[Diagnostics.Process]::GetCurrentProcess().MainModule.FileName; if($p -and ([IO.Path]::GetFileName($p) -notmatch '^(powershell|pwsh|powershell_ise)\.exe$')){ return $p } }catch{}
+    if($PSCommandPath){ return $PSCommandPath }
+    return $null
+}
+function Get-AppFolder{
+    $s=Get-SelfPath; if($s){ return (Split-Path -Parent $s) }
+    return $script:LogDir
+}
+# Free-space check: needs asset size + margin (50 MB or 10%, whichever is larger).
+function Test-DownloadSpace([string]$folder,[int64]$assetSize){
+    $res=[PSCustomObject]@{ Ok=$false; Free=[int64]0; Need=[int64]0; Message='' }
+    try{
+        $margin=[int64][Math]::Max([double]50MB,[Math]::Ceiling([double]$assetSize*0.1))
+        $res.Need=$assetSize+$margin
+        $root=[IO.Path]::GetPathRoot([IO.Path]::GetFullPath($folder))
+        if($root.StartsWith('\\')){ $res.Message='Network (UNC) folders cannot be checked for free space; choose a local drive.'; return $res }
+        $di=New-Object IO.DriveInfo $root
+        if($di.DriveType -ne 'Fixed'){ $res.Message="Drive $root is not a fixed local drive."; return $res }
+        $res.Free=[int64]$di.AvailableFreeSpace
+        if($res.Free -ge $res.Need){ $res.Ok=$true } else { $res.Message="Not enough free space on $root : $(Format-Size $res.Free) free, $(Format-Size $res.Need) needed." }
+    }catch{ $res.Message='Could not check free space: ' + $_.Exception.Message }
+    return $res
+}
+# Only github.com/Ivan-Ryukendo/... https links may be downloaded.
+function Test-AllowedDownloadUrl([string]$u){ return [bool]($u -match '^https://github\.com/Ivan-Ryukendo/[A-Za-z0-9._-]+/releases/download/') }
+# Finishes a download: size check, optional SHA-256 check, then moves .part -> final name.
+function Complete-Download([string]$part,[string]$final,[int64]$expectedSize,[string]$sha256,[bool]$overwrite){
+    $r=[PSCustomObject]@{ Ok=$false; Message='' }
+    try{
+        $len=(Get-Item -LiteralPath $part -Force -EA Stop).Length
+        if($expectedSize -gt 0 -and $len -ne $expectedSize){ $r.Message="Size mismatch: got $len bytes, expected $expectedSize. The partial file was deleted."; Remove-Item -LiteralPath $part -Force -EA SilentlyContinue; return $r }
+        if($sha256){
+            $h=(Get-FileHash -LiteralPath $part -Algorithm SHA256 -EA Stop).Hash.ToLower()
+            if($h -ne $sha256.ToLower()){ $r.Message='SHA-256 checksum mismatch. The partial file was deleted.'; Remove-Item -LiteralPath $part -Force -EA SilentlyContinue; return $r }
+        }
+        if((Test-Path -LiteralPath $final) -and -not $overwrite){ $r.Message='The target file already exists.'; return $r }
+        Move-Item -LiteralPath $part -Destination $final -Force -EA Stop
+        $r.Ok=$true; $r.Message="Saved to $final"
+    }catch{ $r.Message='Could not finish the download: ' + $_.Exception.Message }
+    Write-CleanLog ("DOWNLOAD finish ok={0} {1} :: {2}" -f $r.Ok,$final,$r.Message)
+    return $r
+}
+
+# The ONLY delete this program does outside caches: the one old installer .exe it came from.
+function Test-SafeInstallerDelete([string]$path,[string]$newFile,[string]$running,[switch]$RequireOurName){
+    $r=[PSCustomObject]@{ Ok=$false; Why='' }
+    try{
+        if([string]::IsNullOrWhiteSpace($path)){ $r.Why='no path'; return $r }
+        if($path -match '[\*\?<>|"]'){ $r.Why='wildcard or invalid characters'; return $r }
+        $full=[IO.Path]::GetFullPath($path)
+        if($full.Length -lt 8 -or [IO.Path]::GetPathRoot($full) -eq $full){ $r.Why='not a file path'; return $r }
+        if([IO.Path]::GetExtension($full) -ine '.exe'){ $r.Why='not an .exe file'; return $r }
+        if(-not (Test-Path -LiteralPath $full -PathType Leaf)){ $r.Why='file does not exist (or is a folder)'; return $r }
+        $fi=Get-Item -LiteralPath $full -Force
+        if($fi.PSIsContainer -or ($fi.Attributes -band [IO.FileAttributes]::ReparsePoint)){ $r.Why='folder or link'; return $r }
+        if($newFile -and ($full -ieq [IO.Path]::GetFullPath($newFile))){ $r.Why='this is the NEW file'; return $r }
+        if($running -and ($full -ieq [IO.Path]::GetFullPath($running))){ $r.Why='this is the program that is running right now'; return $r }
+        foreach($bad in @($env:SystemRoot,$env:ProgramFiles,${env:ProgramFiles(x86)},$env:ProgramW6432)){
+            if($bad -and $full.StartsWith($bad.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)){ $r.Why="inside $bad"; return $r }
+        }
+        if($RequireOurName -and ([IO.Path]::GetFileName($full) -notmatch '^CleanPC.*\.exe$')){ $r.Why='file name is not CleanPC*.exe'; return $r }
+        $r.Ok=$true
+    }catch{ $r.Why=$_.Exception.Message }
+    return $r
+}
+function Write-PendingDelete([string]$oldPath,[string]$oldVersion,[string]$newFile){
+    try{
+        $dir=Split-Path -Parent $script:MarkerPath
+        if(-not (Test-Path -LiteralPath $dir)){ New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Set-Content -LiteralPath $script:MarkerPath -Encoding UTF8 -Value @("old=$oldPath","oldversion=$oldVersion","new=$newFile","utc=$((Get-Date).ToUniversalTime().ToString('s'))")
+        Write-CleanLog "MARKER written: delete old installer $oldPath (v$oldVersion) after upgrade to $newFile"
+        return $true
+    }catch{ Write-CleanLog "MARKER write failed: $($_.Exception.Message)"; return $false }
+}
+function Clear-PendingDelete{ try{ Remove-Item -LiteralPath $script:MarkerPath -Force -EA SilentlyContinue }catch{} }
+# New-version startup: returns {Old;OldVersion;New} when the user should be asked once, else $null.
+function Get-PendingDelete{
+    try{
+        if(-not (Test-Path -LiteralPath $script:MarkerPath -PathType Leaf)){ return $null }
+        $m=@{}; foreach($l in @(Get-Content -LiteralPath $script:MarkerPath -EA Stop)){ if($l -match '^([a-z]+)=(.*)$'){ $m[$Matches[1]]=$Matches[2] } }
+        if(-not $m['old'] -or -not (Test-Path -LiteralPath $m['old'] -PathType Leaf)){ Clear-PendingDelete; return $null }   # already gone
+        $self=Get-SelfPath
+        if(-not $self -or -not $m['new'] -or ($self -ine $m['new'])){ return $null }                                      # not the new version (yet)
+        $ov=ConvertTo-AppVersion $m['oldversion']; $cv=ConvertTo-AppVersion $script:AppVersion
+        $isPro = ([IO.Path]::GetFileName($self) -match 'Pro')
+        if($ov -and $cv -and -not $isPro -and $ov -ge $cv){ Clear-PendingDelete; return $null }
+        $chk=Test-SafeInstallerDelete $m['old'] $self $self -RequireOurName
+        if(-not $chk.Ok){ Write-CleanLog "MARKER ignored ($($chk.Why)): $($m['old'])"; Clear-PendingDelete; return $null }
+        return [PSCustomObject]@{ Old=$m['old']; OldVersion=$m['oldversion']; New=$self }
+    }catch{ return $null }
+}
+function Remove-OldInstaller([string]$oldPath,[string]$newFile,[string]$running,[switch]$RequireOurName){
+    $chk=Test-SafeInstallerDelete $oldPath $newFile $running -RequireOurName:$RequireOurName
+    if(-not $chk.Ok){ Write-CleanLog "OLD INSTALLER delete REFUSED ($($chk.Why)): $oldPath"; return $false }
+    try{
+        Remove-Item -LiteralPath $oldPath -Force -EA Stop
+        Write-CleanLog "OLD INSTALLER deleted (user chose Delete): $oldPath"
+        return $true
+    }catch{ Write-CleanLog "OLD INSTALLER delete failed $oldPath : $($_.Exception.Message)"; return $false }
+}
+# A running exe cannot delete itself: start a tiny hidden cmd that retries deleting that ONE file until
+# this program has exited (up to ~10 minutes). Same safety checks as above.
+function Start-DeferredDelete([string]$oldPath,[string]$newFile){
+    $chk=Test-SafeInstallerDelete $oldPath $newFile $null
+    if(-not $chk.Ok){ Write-CleanLog "DEFERRED delete REFUSED ($($chk.Why)): $oldPath"; return $false }
+    if($oldPath -match '[%&^!]'){ Write-CleanLog "DEFERRED delete REFUSED (special characters in path): $oldPath"; return $false }
+    try{
+        $cl = 'for /l %i in (1,1,600) do @if exist "{0}" (del /f /q "{0}" >nul 2>&1 & ping -n 2 127.0.0.1 >nul)' -f $oldPath
+        Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @('/d','/c',$cl) -WindowStyle Hidden
+        Write-CleanLog "DEFERRED delete scheduled (runs after this program exits): $oldPath"
+        return $true
+    }catch{ Write-CleanLog "DEFERRED delete failed to start: $($_.Exception.Message)"; return $false }
+}
+
+# ---------------------------------------------------------------- restore point
+function Test-RestoreDisabled{
+    try{
+        $pol=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore' -EA SilentlyContinue
+        if($pol -and $pol.DisableSR -eq 1){ return $true }
+        $vs=@(& vssadmin.exe list shadowstorage 2>$null)
+        if($vs.Count -gt 0 -and ($vs -join "`n") -match 'For volume'){ return (($vs -join "`n") -notmatch ("\(" + [regex]::Escape($env:SystemDrive) + "\)")) }
+    }catch{}
+    return $false
+}
+function Get-LastRestoreSeq{ try{ $m=(Get-ComputerRestorePoint -EA Stop | Measure-Object SequenceNumber -Maximum).Maximum; if($m){ return [int]$m } }catch{}; return 0 }
+# Status: Created | Skipped24h | Disabled | NotAdmin | Failed.  Never throws; Windows allows 1 per 24 h by default.
+function New-CleanRestorePoint{
+    $r=[PSCustomObject]@{ Status='Failed'; Message='' }
+    try{
+        if(-not (Is-Admin)){ $r.Status='NotAdmin'; $r.Message='Creating a restore point needs Administrator rights.'; return $r }
+        if(Test-RestoreDisabled){ $r.Status='Disabled'; $r.Message='System Restore appears to be turned off for the Windows drive.'; return $r }
+        $before=Get-LastRestoreSeq
+        $wv=$null
+        Checkpoint-Computer -Description "PC Cache Cleaner $script:AppVersion" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop -WarningVariable wv -WarningAction SilentlyContinue
+        $after=Get-LastRestoreSeq
+        $w=(@($wv) | ForEach-Object { [string]$_ }) -join ' '
+        if($after -gt $before){ $r.Status='Created'; $r.Message='Restore point created.' }
+        elseif($w -match '1440|already been created|within the past'){ $r.Status='Skipped24h'; $r.Message='Windows allows one restore point per 24 hours and one was already created recently; the existing one still protects you.' }
+        elseif($w -match 'disabled|turned off'){ $r.Status='Disabled'; $r.Message='System Restore is turned off.' }
+        else{ $r.Status='Failed'; $r.Message=$(if($w){$w}else{'Windows did not create a restore point.'}) }
+    }catch{
+        $msg=$_.Exception.Message
+        if($msg -match 'disabled|turned off'){ $r.Status='Disabled'; $r.Message='System Restore is turned off.' }
+        elseif($msg -match '1440|already been created|within the past'){ $r.Status='Skipped24h'; $r.Message='Windows allows one restore point per 24 hours and one was already created recently.' }
+        else{ $r.Status='Failed'; $r.Message=$msg }
+    }
+    Write-CleanLog ("RESTORE POINT status={0} {1}" -f $r.Status,$r.Message)
+    return $r
+}
+
+# ---------------------------------------------------------------- report export (HTML / CSV)
+# $Cleanup rows need: Name Category Size Paths Note Ticked.  $Report rows: Name Size Paths Note.  $Security: result of Get-SecurityReport or $null.
+function Get-RiskLabel($note){ if([string]$note -like 'RISKY*'){ return 'Risky' } else { return 'Normal' } }
+function ConvertTo-CsvCell([string]$s){
+    if($s -match '^[=+\-@\t]'){ $s = "'" + $s }          # neutralise spreadsheet formulas
+    return '"' + ($s -replace '"','""') + '"'
+}
+function Export-CleanReport([string]$Path,[string]$Format,$Cleanup,$Report,$Security,[string[]]$Drives){
+    $res=[PSCustomObject]@{ Ok=$false; Message='' }
+    try{
+        if(-not $Format){ $Format = $(if([IO.Path]::GetExtension($Path) -ieq '.csv'){'csv'}else{'html'}) }
+        $Cleanup=@($Cleanup); $Report=@($Report)
+        $gen=Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $tick=[int64]0; foreach($c in $Cleanup){ if($c.Ticked){ $tick += [int64]$c.Size } }
+        if($Format -eq 'csv'){
+            $sb=New-Object System.Text.StringBuilder
+            [void]$sb.AppendLine('Section,Name,Category,SizeBytes,Size,Ticked,Risk,Note,Paths')
+            foreach($c in $Cleanup){ [void]$sb.AppendLine((@('Cleanup',$c.Name,$c.Category,[string][int64]$c.Size,(Format-Size $c.Size),$(if($c.Ticked){'yes'}else{'no'}),(Get-RiskLabel $c.Note),$c.Note,(@($c.Paths) -join ' | ')) | ForEach-Object { ConvertTo-CsvCell ([string]$_) }) -join ',') }
+            foreach($c in $Report){ [void]$sb.AppendLine((@('Report only',$c.Name,'Report',[string][int64]$c.Size,(Format-Size $c.Size),'no','Report only',$c.Note,(@($c.Paths) -join ' | ')) | ForEach-Object { ConvertTo-CsvCell ([string]$_) }) -join ',') }
+            if($Security){ foreach($x in @($Security.Items)){ [void]$sb.AppendLine((@('Security',$x.Name,$x.Type,'','','no',$x.Severity,$x.Reasons,$x.Path) | ForEach-Object { ConvertTo-CsvCell ([string]$_) }) -join ',') } }
+            [IO.File]::WriteAllText($Path,$sb.ToString(),(New-Object System.Text.UTF8Encoding($true)))
+        } else {
+            $e={ param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
+            $h=New-Object System.Text.StringBuilder
+            [void]$h.AppendLine('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>PC Cache Cleaner report</title>')
+            [void]$h.AppendLine('<style>body{font:14px Segoe UI,Arial,sans-serif;margin:24px;color:#222}h1{font-size:20px}h2{font-size:16px;margin-top:28px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:5px 8px;text-align:left;vertical-align:top}th{background:#f0f0f0}td.n{text-align:right;white-space:nowrap}.risk{color:#a00;font-weight:600}.paths{font:12px Consolas,monospace;color:#444;word-break:break-all}.meta{color:#555}</style></head><body>')
+            [void]$h.AppendLine("<h1>PC Cache Cleaner report</h1><p class=""meta"">Generated $(& $e $gen) by v$(& $e $script:AppVersion). Drives: $(& $e ($Drives -join ', ')). Ticked total: <b>$(& $e (Format-Size $tick))</b>. Nothing in this report has been deleted by exporting it.</p>")
+            [void]$h.AppendLine('<h2>Cleanup items</h2><table><tr><th>Ticked</th><th>Item</th><th>Category</th><th>Size</th><th>Risk</th><th>Note</th><th>Paths</th></tr>')
+            foreach($c in $Cleanup){ [void]$h.AppendLine("<tr><td>$(if($c.Ticked){'yes'}else{'no'})</td><td>$(& $e $c.Name)</td><td>$(& $e $c.Category)</td><td class=""n"">$(& $e (Format-Size $c.Size))</td><td class=""$(if((Get-RiskLabel $c.Note) -eq 'Risky'){'risk'})"">$(Get-RiskLabel $c.Note)</td><td>$(& $e $c.Note)</td><td class=""paths"">$(& $e (@($c.Paths) -join ' | '))</td></tr>") }
+            [void]$h.AppendLine('</table>')
+            if($Report.Count -gt 0){
+                [void]$h.AppendLine('<h2>Report only (this tool never deletes these)</h2><table><tr><th>Item</th><th>Size</th><th>How to deal with it</th><th>Location</th></tr>')
+                foreach($c in $Report){ [void]$h.AppendLine("<tr><td>$(& $e $c.Name)</td><td class=""n"">$(& $e (Format-Size $c.Size))</td><td>$(& $e $c.Note)</td><td class=""paths"">$(& $e (@($c.Paths) -join ' | '))</td></tr>") }
+                [void]$h.AppendLine('</table>')
+            }
+            if($Security){
+                [void]$h.AppendLine("<h2>Security check (heuristic: suspicious, review - not confirmed malware)</h2><p class=""meta"">$(@($Security.Items).Count) item(s) flagged.</p><table><tr><th>Level</th><th>Type</th><th>Name</th><th>Why</th><th>Path</th></tr>")
+                foreach($x in @($Security.Items)){ [void]$h.AppendLine("<tr><td>$(& $e $x.Severity)</td><td>$(& $e $x.Type)</td><td>$(& $e $x.Name)</td><td>$(& $e $x.Reasons)</td><td class=""paths"">$(& $e $x.Path)</td></tr>") }
+                [void]$h.AppendLine('</table>')
+            }
+            [void]$h.AppendLine('</body></html>')
+            [IO.File]::WriteAllText($Path,$h.ToString(),(New-Object System.Text.UTF8Encoding($false)))
+        }
+        $res.Ok=$true; $res.Message="Report saved to $Path"
+    }catch{ $res.Message='Could not save the report: ' + $_.Exception.Message }
+    Write-CleanLog ("REPORT EXPORT ok={0} {1} :: {2}" -f $res.Ok,$Path,$res.Message)
+    return $res
+}
 #endregion CORE
 
 # ================================================================ GUI
@@ -943,6 +1307,8 @@ $header.Text="Tick the items you want to delete, then press 'Clean Selected'. On
 $header.Dock='Fill'; $header.TextAlign='MiddleLeft'; $header.Padding=New-Object System.Windows.Forms.Padding(10,0,10,0)
 $header.Font=$fontUI
 $headerPanel.Controls.Add($header)
+$btnUpdate=New-Object System.Windows.Forms.Button; $btnUpdate.Text='Check for updates'; $btnUpdate.Dock='Right'; $btnUpdate.Width=140; $btnUpdate.Font=$fontUI
+$headerPanel.Controls.Add($btnUpdate)
 
 # Drive selection (one box per fixed local drive + All drives)
 $drivePanel=New-Object System.Windows.Forms.Panel; $drivePanel.Dock='Top'; $drivePanel.Height=62
@@ -1017,7 +1383,7 @@ $tpSec.Controls.Add($lvS); $tpSec.Controls.Add($pnlSecTop); $tpSec.Controls.Add(
 
 $lvHost.Controls.Add($tabs)
 
-$panel=New-Object System.Windows.Forms.Panel; $panel.Dock='Bottom'; $panel.Height=105
+$panel=New-Object System.Windows.Forms.Panel; $panel.Dock='Bottom'; $panel.Height=128
 
 # WinForms dock resolves by z-order: the Fill control must be added FIRST
 # (lowest z-order), then the Top/Bottom panels, so Fill takes the leftover space.
@@ -1044,18 +1410,20 @@ function Update-Total{
 }
 $lv.Add_ItemChecked({ Update-Total })
 
-$btnAll=New-Object System.Windows.Forms.Button; $btnAll.Text='Select safe'; $btnAll.Width=90; $btnAll.Height=34; $btnAll.Left=12; $btnAll.Top=52
+$btnAll=New-Object System.Windows.Forms.Button; $btnAll.Text='Select safe'; $btnAll.Width=90; $btnAll.Height=34; $btnAll.Left=12; $btnAll.Top=82
 $btnAll.Add_Click({ foreach($i in $lv.Items){ $i.Checked=[bool]$i.Tag.Checked } })
-$btnNone=New-Object System.Windows.Forms.Button; $btnNone.Text='Select none'; $btnNone.Width=90; $btnNone.Height=34; $btnNone.Left=110; $btnNone.Top=52
+$btnNone=New-Object System.Windows.Forms.Button; $btnNone.Text='Select none'; $btnNone.Width=90; $btnNone.Height=34; $btnNone.Left=110; $btnNone.Top=82
 $btnNone.Add_Click({ foreach($i in $lv.Items){$i.Checked=$false} })
-$btnClean=New-Object System.Windows.Forms.Button; $btnClean.Text='Clean Selected'; $btnClean.Width=140; $btnClean.Height=34; $btnClean.Top=52
+$btnClean=New-Object System.Windows.Forms.Button; $btnClean.Text='Clean Selected'; $btnClean.Width=140; $btnClean.Height=34; $btnClean.Top=82
 $btnClean.Font=$fontBold
-$btnClose=New-Object System.Windows.Forms.Button; $btnClose.Text='Close'; $btnClose.Width=90; $btnClose.Height=34; $btnClose.Top=52
+$btnClose=New-Object System.Windows.Forms.Button; $btnClose.Text='Close'; $btnClose.Width=90; $btnClose.Height=34; $btnClose.Top=82
 $btnClose.Add_Click({ $form.Close() })
 # Cancel: only visible while cleaning; sets a flag the loop checks between items (never mid-delete).
-$btnCancel=New-Object System.Windows.Forms.Button; $btnCancel.Text='Cancel'; $btnCancel.Width=90; $btnCancel.Height=34; $btnCancel.Top=52; $btnCancel.Visible=$false
+$btnCancel=New-Object System.Windows.Forms.Button; $btnCancel.Text='Cancel'; $btnCancel.Width=90; $btnCancel.Height=34; $btnCancel.Top=82; $btnCancel.Visible=$false
 $btnCancel.Add_Click({ $script:cancelRequested=$true; $btnCancel.Enabled=$false; $status.Text='Cancelling after current item...' })
-$panel.Controls.AddRange(@($btnAll,$btnNone,$btnClean,$btnClose,$btnCancel))
+$btnExport=New-Object System.Windows.Forms.Button; $btnExport.Text='Export report'; $btnExport.Width=110; $btnExport.Height=34; $btnExport.Left=208; $btnExport.Top=82
+$cbRestore=New-Object System.Windows.Forms.CheckBox; $cbRestore.Text='Create a System Restore point before cleaning'; $cbRestore.AutoSize=$true; $cbRestore.Left=12; $cbRestore.Top=54; $cbRestore.Checked=$false; $cbRestore.Font=$fontUI
+$panel.Controls.AddRange(@($btnAll,$btnNone,$btnExport,$cbRestore,$btnClean,$btnClose,$btnCancel))
 $panel.Add_Resize({ $btnClose.Left=$panel.Width-104; $btnCancel.Left=$panel.Width-104; $btnClean.Left=$panel.Width-252 })
 $btnClose.Left=$form.Width-120; $btnCancel.Left=$form.Width-120; $btnClean.Left=$form.Width-268
 
@@ -1085,13 +1453,222 @@ function Confirm-TypedName([string]$title,[string]$message,[string]$expected){
     return ($r -eq 'OK')
 }
 
+# ---------------------------------------------------------------- update checker / download dialogs (only on click)
+# Generic Keep/Delete style dialog: returns the text of the clicked button, or $null if closed with X.
+function Show-ChoiceDialog([string]$title,[string]$message,[string[]]$buttons){
+    $script:choiceResult=$null
+    $f=New-Object System.Windows.Forms.Form; $f.Text=$title; $f.StartPosition='CenterParent'; $f.FormBorderStyle='FixedDialog'; $f.MaximizeBox=$false; $f.MinimizeBox=$false; $f.ShowInTaskbar=$false
+    $f.ClientSize=New-Object System.Drawing.Size(560,170)
+    if($script:appIcon){ $f.Icon=$script:appIcon }
+    $l=New-Object System.Windows.Forms.Label; $l.Left=14; $l.Top=12; $l.Width=530; $l.Height=100; $l.Text=$message; $l.Font=$fontUI
+    $f.Controls.Add($l)
+    $x=546
+    for($i=$buttons.Count-1;$i -ge 0;$i--){
+        $b=New-Object System.Windows.Forms.Button; $b.Text=$buttons[$i]; $b.Height=30
+        $b.Width=[Math]::Max(90,[int]($buttons[$i].Length*7.5+24)); $x-=($b.Width+8); $b.Left=$x; $b.Top=126
+        $b.Add_Click({ param($s,$e) $script:choiceResult=$s.Text; $s.FindForm().Close() })
+        $f.Controls.Add($b)
+    }
+    [void]$f.ShowDialog($form); $f.Dispose()
+    return $script:choiceResult
+}
+
+# After a successful download: ask whether to keep or delete the old installer (the exe this program runs from).
+function Invoke-OldInstallerPrompt([string]$newFile){
+    $self=Get-SelfPath
+    if(-not $self -or [IO.Path]::GetExtension($self) -ine '.exe'){ Write-CleanLog 'OLD INSTALLER prompt skipped: running from a script, not an exe'; return }
+    $chk=Test-SafeInstallerDelete $self $newFile $null
+    if(-not $chk.Ok){ Write-CleanLog "OLD INSTALLER prompt skipped ($($chk.Why)): $self"; return }
+    $c=Show-ChoiceDialog 'Old installer' "Do you want to keep the old installer or delete it?`n`nOld (this program, v$script:AppVersion):`n$self`n`nNew:`n$newFile" @('Keep','Delete')
+    if($c -ne 'Delete'){ Write-CleanLog "OLD INSTALLER kept by user: $self"; return }
+    Write-PendingDelete $self $script:AppVersion $newFile | Out-Null
+    $c2=Show-ChoiceDialog 'Delete old installer' "A running program cannot delete itself. Delete it automatically right after you close this program?`n`nOnly this one file will be deleted:`n$self`n`nIf you choose 'Ask later', you will be asked once more when the new version starts." @('Delete when I close this program','Ask later')
+    if($c2 -like 'Delete when*'){
+        if(Start-DeferredDelete $self $newFile){ [System.Windows.Forms.MessageBox]::Show("Scheduled. The old file will be deleted as soon as you close this program (a hidden helper retries for up to 10 minutes).","Old installer",'OK','Information')|Out-Null }
+        else { [System.Windows.Forms.MessageBox]::Show("Could not schedule the deletion. You will be asked again when the new version starts.","Old installer",'OK','Warning')|Out-Null }
+    }
+}
+
+# New version, first launch: a marker from the previous version says the user wanted the old exe deleted (or undecided).
+function Invoke-StartupInstallerPrompt{
+    try{
+        $p=Get-PendingDelete
+        if(-not $p){ return }
+        Write-CleanLog "STARTUP: pending old installer $($p.Old) (v$($p.OldVersion))"
+        $c=Show-ChoiceDialog 'Old installer' "Do you want to keep the old installer or delete it?`n`nOld (v$($p.OldVersion)):`n$($p.Old)`n`nOnly this one file would be deleted." @('Keep','Delete')
+        if($c -eq 'Delete'){
+            if(Remove-OldInstaller $p.Old $p.New $p.New -RequireOurName){ [System.Windows.Forms.MessageBox]::Show("Old installer deleted.","Old installer",'OK','Information')|Out-Null }
+            else { [System.Windows.Forms.MessageBox]::Show("Could not delete it (it may still be running). See the log.","Old installer",'OK','Warning')|Out-Null }
+        } else { Write-CleanLog "OLD INSTALLER kept by user: $($p.Old)" }
+        if($c){ Clear-PendingDelete }
+    }catch{ Write-CleanLog "STARTUP installer prompt error: $($_.Exception.Message)" }
+}
+
+function Show-DownloadDialog($info){
+    $title= if($info.Channel -eq 'Pro'){ 'Upgrade to Pro (free) - download' }else{ 'Download update' }
+    $tag=($info.Tag -replace '[^A-Za-z0-9._-]','')
+    $fileName="$([IO.Path]::GetFileNameWithoutExtension($info.AssetName))-$tag.exe"
+    if(-not (Test-AllowedDownloadUrl $info.AssetUrl)){ [System.Windows.Forms.MessageBox]::Show("The download address is not an official GitHub release link, so it was blocked.","Download",'OK','Warning')|Out-Null; return }
+    $script:dlBusy=$false; $script:dlObj=$null; $script:dlFolder2=$null
+    $f=New-Object System.Windows.Forms.Form; $f.Text=$title; $f.StartPosition='CenterParent'; $f.FormBorderStyle='FixedDialog'; $f.MaximizeBox=$false; $f.MinimizeBox=$false; $f.ShowInTaskbar=$false
+    $f.ClientSize=New-Object System.Drawing.Size(600,360); if($script:appIcon){ $f.Icon=$script:appIcon }
+    $lInfo=New-Object System.Windows.Forms.Label; $lInfo.Left=14; $lInfo.Top=10; $lInfo.Width=572; $lInfo.Height=40; $lInfo.Font=$fontBold
+    $lInfo.Text="$($info.AssetName) $($info.Tag)  ($(Format-Size $info.AssetSize))`nSaved as: $fileName   - never run or replaced automatically."
+    $rb1=New-Object System.Windows.Forms.RadioButton; $rb1.Text='Same drive as this program (folder of the running exe/script)'; $rb1.Left=14; $rb1.Top=58; $rb1.Width=570; $rb1.Checked=$true
+    $rb2=New-Object System.Windows.Forms.RadioButton; $rb2.Text='Another drive/folder'; $rb2.Left=14; $rb2.Top=84; $rb2.Width=200
+    $btnBr=New-Object System.Windows.Forms.Button; $btnBr.Text='Choose drive/folder...'; $btnBr.Left=220; $btnBr.Top=80; $btnBr.Width=170; $btnBr.Height=26; $btnBr.Enabled=$false
+    $dv=@(Get-FixedDrives | ForEach-Object { "$($_.Letter) $(Format-Size $_.Free) free" }) -join '   |   '
+    $lDrv=New-Object System.Windows.Forms.Label; $lDrv.Left=34; $lDrv.Top=112; $lDrv.Width=552; $lDrv.Height=34; $lDrv.ForeColor=[System.Drawing.Color]::DimGray; $lDrv.Text="Fixed drives: $dv"
+    $lTgt=New-Object System.Windows.Forms.Label; $lTgt.Left=14; $lTgt.Top=152; $lTgt.Width=572; $lTgt.Height=36; $lTgt.Font=$fontUI
+    $lSpc=New-Object System.Windows.Forms.Label; $lSpc.Left=14; $lSpc.Top=190; $lSpc.Width=572; $lSpc.Height=34
+    $pb=New-Object System.Windows.Forms.ProgressBar; $pb.Left=14; $pb.Top=232; $pb.Width=572; $pb.Height=22; $pb.Minimum=0; $pb.Maximum=1000
+    $lPrg=New-Object System.Windows.Forms.Label; $lPrg.Left=14; $lPrg.Top=258; $lPrg.Width=572; $lPrg.Height=40
+    $btnGo=New-Object System.Windows.Forms.Button; $btnGo.Text='Download'; $btnGo.Left=300; $btnGo.Top=312; $btnGo.Width=130; $btnGo.Height=32; $btnGo.Font=$fontBold
+    $btnNo=New-Object System.Windows.Forms.Button; $btnNo.Text='Cancel'; $btnNo.Left=446; $btnNo.Top=312; $btnNo.Width=140; $btnNo.Height=32
+    $f.Controls.AddRange(@($lInfo,$rb1,$rb2,$btnBr,$lDrv,$lTgt,$lSpc,$pb,$lPrg,$btnGo,$btnNo))
+    $refresh={
+        $folder = if($rb1.Checked){ Get-AppFolder } else { $script:dlFolder2 }
+        if(-not $folder){ $lTgt.Text='Target folder: (choose a drive/folder)'; $lSpc.Text=''; $btnGo.Enabled=$false; return }
+        $lTgt.Text="Target folder: $folder"
+        $sp=Test-DownloadSpace $folder $info.AssetSize
+        if($sp.Ok){ $lSpc.ForeColor=[System.Drawing.Color]::DarkGreen; $lSpc.Text="Free space OK: $(Format-Size $sp.Free) free, $(Format-Size $sp.Need) needed (file + margin)." }
+        else{ $lSpc.ForeColor=[System.Drawing.Color]::DarkRed; $lSpc.Text=$sp.Message }
+        $btnGo.Enabled=$sp.Ok
+    }
+    $rb1.Add_CheckedChanged({ $btnBr.Enabled=$rb2.Checked; & $refresh })
+    $btnBr.Add_Click({
+        $fb=New-Object System.Windows.Forms.FolderBrowserDialog; $fb.Description='Choose a folder on a local drive for the download'; $fb.ShowNewFolderButton=$true
+        if($script:dlFolder2){ $fb.SelectedPath=$script:dlFolder2 }
+        if($fb.ShowDialog($f) -eq 'OK'){ $script:dlFolder2=$fb.SelectedPath }
+        & $refresh
+    })
+    $btnNo.Add_Click({ if($script:dlBusy -and $script:dlObj){ $script:dlObj.Cancel=$true; $btnNo.Enabled=$false; $lPrg.Text='Cancelling...' } else { $f.Close() } })
+    $f.Add_FormClosing({ if($script:dlBusy){ $_.Cancel=$true; if($script:dlObj){ $script:dlObj.Cancel=$true }; $lPrg.Text='Cancelling...' } })
+    $btnGo.Add_Click({
+        $folder = if($rb1.Checked){ Get-AppFolder } else { $script:dlFolder2 }
+        if(-not $folder){ return }
+        try{ if(-not (Test-Path -LiteralPath $folder)){ New-Item -ItemType Directory -Path $folder -Force -EA Stop | Out-Null } }catch{ [System.Windows.Forms.MessageBox]::Show("Cannot use that folder: $($_.Exception.Message)","Download",'OK','Warning')|Out-Null; return }
+        $sp=Test-DownloadSpace $folder $info.AssetSize
+        if(-not $sp.Ok){ [System.Windows.Forms.MessageBox]::Show($sp.Message,"Download",'OK','Warning')|Out-Null; return }
+        $final=Join-Path $folder $fileName
+        $selfp=Get-SelfPath
+        $overwrite=$false
+        if(Test-Path -LiteralPath $final){
+            if($selfp -and ($final -ieq $selfp)){ $final=Join-Path $folder ("{0}-new{1}" -f [IO.Path]::GetFileNameWithoutExtension($fileName),'.exe') }
+            if(Test-Path -LiteralPath $final){
+                $a=[System.Windows.Forms.MessageBox]::Show("A file named`n$final`nalready exists. Replace it?","File exists",'YesNo','Warning')
+                if($a -ne 'Yes'){ return }
+                $overwrite=$true
+            }
+        }
+        $part="$final.part"
+        $script:dlBusy=$true; $btnGo.Enabled=$false; $rb1.Enabled=$false; $rb2.Enabled=$false; $btnBr.Enabled=$false
+        Write-CleanLog "DOWNLOAD start $($info.AssetUrl) -> $final ($(Format-Size $info.AssetSize))"
+        $dl=New-Object CleanDownloader; $script:dlObj=$dl
+        Enable-Tls12
+        $dl.Start($info.AssetUrl,"CleanPC/$script:AppVersion",$part,20000)
+        while(-not $dl.Done){
+            $tot= if($dl.Total -gt 0){ $dl.Total }else{ $info.AssetSize }
+            if($tot -gt 0){ $pb.Value=[int][Math]::Min(1000,[Math]::Floor(1000.0*$dl.BytesDone/$tot)) }
+            $lPrg.Text="Downloading... $(Format-Size $dl.BytesDone) of $(Format-Size $tot)"
+            [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 60
+        }
+        $script:dlBusy=$false
+        if(-not $dl.Ok){
+            Remove-Item -LiteralPath $part -Force -EA SilentlyContinue
+            $why= if($dl.Error -eq 'cancelled'){ 'Download cancelled. The partial file was removed.' }else{ "Download failed: $($dl.Error). The partial file was removed." }
+            Write-CleanLog "DOWNLOAD failed/cancelled: $($dl.Error)"
+            $lPrg.Text=$why; $pb.Value=0; $btnGo.Enabled=$true; $btnNo.Enabled=$true; $rb1.Enabled=$true; $rb2.Enabled=$true; $btnBr.Enabled=$rb2.Checked
+            return
+        }
+        $lPrg.Text='Verifying...'; [System.Windows.Forms.Application]::DoEvents()
+        $fin=Complete-Download $part $final $info.AssetSize $info.AssetSha256 $overwrite
+        if(-not $fin.Ok){
+            [System.Windows.Forms.MessageBox]::Show($fin.Message,"Download",'OK','Warning')|Out-Null
+            $lPrg.Text=$fin.Message; $pb.Value=0; $btnGo.Enabled=$true; $btnNo.Enabled=$true; $rb1.Enabled=$true; $rb2.Enabled=$true; $btnBr.Enabled=$rb2.Checked
+            return
+        }
+        $pb.Value=1000
+        $chk= if($info.AssetSha256){ 'size and SHA-256 verified' }else{ 'size verified (no checksum published)' }
+        $lPrg.Text="Done - $chk."
+        $c=Show-ChoiceDialog 'Download complete' "Downloaded and verified ($chk):`n$final`n`nThe file has NOT been run. Start it yourself when you are ready." @('Open folder','Close')
+        if($c -eq 'Open folder'){ try{ Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $final) }catch{} }
+        Invoke-OldInstallerPrompt $final
+        $f.Close()
+    })
+    & $refresh
+    [void]$f.ShowDialog($form); $f.Dispose()
+}
+
+function Show-UpdateDialog($all){
+    $f=New-Object System.Windows.Forms.Form; $f.Text='Check for updates'; $f.StartPosition='CenterParent'; $f.FormBorderStyle='FixedDialog'; $f.MaximizeBox=$false; $f.MinimizeBox=$false; $f.ShowInTaskbar=$false
+    $f.ClientSize=New-Object System.Drawing.Size(660,520); if($script:appIcon){ $f.Icon=$script:appIcon }
+    $mk={
+        param($top,$caption,$info,$isPro)
+        $g=New-Object System.Windows.Forms.GroupBox; $g.Text=$caption; $g.Left=12; $g.Top=$top; $g.Width=636; $g.Height=222; $g.Font=$fontBold
+        $st=New-Object System.Windows.Forms.Label; $st.Left=12; $st.Top=22; $st.Width=610; $st.Height=44; $st.Font=$fontUI
+        $nt=New-Object System.Windows.Forms.TextBox; $nt.Left=12; $nt.Top=70; $nt.Width=610; $nt.Height=104; $nt.Multiline=$true; $nt.ReadOnly=$true; $nt.ScrollBars='Vertical'; $nt.Font=$fontUI
+        $bd=New-Object System.Windows.Forms.Button; $bd.Left=12; $bd.Top=182; $bd.Width=170; $bd.Height=30; $bd.Text='Download...'; $bd.Font=$fontUI
+        $bp=New-Object System.Windows.Forms.Button; $bp.Left=190; $bp.Top=182; $bp.Width=150; $bp.Height=30; $bp.Text='Open release page'; $bp.Font=$fontUI
+        $nt.Visible=$false; $bd.Visible=$false; $bp.Visible=$false
+        $note= if($info.Notes){ "Release notes:`r`n" + ($info.Notes -replace "`n","`r`n") }else{ '' }
+        switch($info.State){
+            'Newer'      { $st.Text="Version $($info.Tag) is available (you have v$script:AppVersion)."; $nt.Text=$note; $nt.Visible=$true; $bd.Visible=($info.AssetUrl -ne ''); $bp.Visible=$true }
+            'UpToDate'   { $st.Text="You are up to date. Latest release: $($info.Tag), you have v$script:AppVersion." }
+            'Available'  { $st.Text="Pro is a separate, fuller-featured app (free for you). Latest: $($info.Tag). It is downloaded as its own file and does not replace this program."; $nt.Text=$note; $nt.Visible=$true; $bd.Text='Download Pro...'; $bd.Visible=$true; $bp.Visible=$true }
+            'NotReleased'{ $st.Text= if($isPro){ 'Pro edition not released yet. Nothing to download for now - check again later.' }else{ $info.Message } }
+            default      { $st.Text="Could not check: $($info.Message)" }
+        }
+        $g.Controls.AddRange(@($st,$nt,$bd,$bp))
+        $bd.Add_Click({ Show-DownloadDialog $info }.GetNewClosure())
+        $bp.Add_Click({ try{ if($info.PageUrl -match '^https://github\.com/'){ Start-Process $info.PageUrl } }catch{} }.GetNewClosure())
+        return $g
+    }
+    $g1 = & $mk 10  'Standard edition (this program)' $all.Standard $false
+    $g2 = & $mk 240 'Upgrade to Pro (free)' $all.Pro $true
+    $bc=New-Object System.Windows.Forms.Button; $bc.Text='Close'; $bc.Left=548; $bc.Top=480; $bc.Width=100; $bc.Height=30; $bc.DialogResult='Cancel'
+    $lnote=New-Object System.Windows.Forms.Label; $lnote.Left=14; $lnote.Top=474; $lnote.Width=520; $lnote.Height=40; $lnote.ForeColor=[System.Drawing.Color]::DimGray
+    $lnote.Text='Checked only because you clicked the button. Nothing is sent except a normal request to api.github.com; nothing is installed or run automatically.'
+    $f.Controls.AddRange(@($g1,$g2,$lnote,$bc)); $f.CancelButton=$bc
+    [void]$f.ShowDialog($form); $f.Dispose()
+}
+
+$btnUpdate.Add_Click({
+    $btnUpdate.Enabled=$false; $old=$status.Text
+    $status.Text='Checking GitHub for updates (you asked for this)...'
+    $all=$null
+    try{ $all=Get-AllUpdateInfo { [System.Windows.Forms.Application]::DoEvents() } }catch{ Write-CleanLog "UPDATE CHECK ERROR: $($_.Exception.Message)" }
+    $status.Text=$old; $btnUpdate.Enabled=$true
+    if(-not $all){ [System.Windows.Forms.MessageBox]::Show("The update check could not be completed. Please try again later.","Check for updates",'OK','Information')|Out-Null; return }
+    Show-UpdateDialog $all
+})
+
+# ---------------------------------------------------------------- report export
+$script:lastSecurity=$null
+$btnExport.Add_Click({
+    if($lv.Items.Count -eq 0 -and $lvR.Items.Count -eq 0){ [System.Windows.Forms.MessageBox]::Show("Nothing to export yet - wait for the scan to finish.","Export report",'OK','Information')|Out-Null; return }
+    $sd=New-Object System.Windows.Forms.SaveFileDialog
+    $sd.Title='Export scan report'; $sd.Filter='HTML report (*.html)|*.html|CSV spreadsheet (*.csv)|*.csv'; $sd.DefaultExt='html'; $sd.AddExtension=$true
+    $sd.FileName='CleanPC-report-' + (Get-Date -Format 'yyyyMMdd-HHmm'); $sd.OverwritePrompt=$true
+    if($sd.ShowDialog($form) -ne 'OK'){ return }
+    $fmt= if($sd.FilterIndex -eq 2 -or [IO.Path]::GetExtension($sd.FileName) -ieq '.csv'){ 'csv' }else{ 'html' }
+    $cl=@(); foreach($i in $lv.Items){ $t=$i.Tag; $cl += [PSCustomObject]@{ Name=$t.Name; Category=$t.Category; Size=$t.Size; Paths=$t.Paths; Note=$t.Note; Ticked=[bool]$i.Checked } }
+    $rp=@(); foreach($i in $lvR.Items){ $rp += $i.Tag }
+    $dr=@(); foreach($b in $script:driveBoxes){ if($b.Checked){ $dr += $b.Tag } }
+    $r=Export-CleanReport $sd.FileName $fmt $cl $rp $script:lastSecurity $dr
+    if($r.Ok){
+        $a=[System.Windows.Forms.MessageBox]::Show("$($r.Message)`n`nOpen it now?","Export report",'YesNo','Information')
+        if($a -eq 'Yes'){ try{ Start-Process $sd.FileName }catch{} }
+    } else { [System.Windows.Forms.MessageBox]::Show($r.Message,"Export report",'OK','Warning')|Out-Null }
+})
+
 # ---------------------------------------------------------------- scan
 function Start-Scan{
     if($script:Scanning){ return }
     $drives=@(); foreach($b in $script:driveBoxes){ if($b.Checked){ $drives += $b.Tag } }
     if($drives.Count -eq 0){ [System.Windows.Forms.MessageBox]::Show("Tick at least one drive to scan.","Clean PC",'OK','Information')|Out-Null; return }
     $script:Scanning=$true; $script:ScanCancel=$false
-    foreach($c in @($btnRescan,$btnClean,$btnAll,$btnNone,$btnDelProf,$btnSec)){ $c.Enabled=$false }
+    foreach($c in @($btnRescan,$btnClean,$btnAll,$btnNone,$btnDelProf,$btnSec,$btnExport)){ $c.Enabled=$false }
     foreach($b in $script:driveBoxes){ $b.Enabled=$false }; $cbAll.Enabled=$false
     $btnStop.Visible=$true; $btnStop.Enabled=$true; $btnRescan.Visible=$false
     $lv.Items.Clear(); $lvR.Items.Clear(); $lvP.Items.Clear()
@@ -1143,7 +1720,7 @@ function Start-Scan{
     }
     $tpProf.Text = "Other user profiles (opt-in) ($($lvP.Items.Count))"
     $btnStop.Visible=$false; $btnRescan.Visible=$true
-    foreach($c in @($btnRescan,$btnClean,$btnAll,$btnNone,$btnDelProf,$btnSec)){ $c.Enabled=$true }
+    foreach($c in @($btnRescan,$btnClean,$btnAll,$btnNone,$btnDelProf,$btnSec,$btnExport)){ $c.Enabled=$true }
     foreach($b in $script:driveBoxes){ $b.Enabled=$true }; $cbAll.Enabled=$true
     $script:Scanning=$false
     Update-Total
@@ -1154,7 +1731,7 @@ $btnStop.Add_Click({ $script:ScanCancel=$true; $btnStop.Enabled=$false; $status.
 $form.Add_FormClosing({
     if($script:Scanning){ $script:ScanCancel=$true; $script:closeAfterScan=$true; $_.Cancel=$true; $status.Text='Stopping scan, window will close...' }
 })
-$form.Add_Shown({ Start-Scan; if($script:closeAfterScan){ $form.Close() } })
+$form.Add_Shown({ Invoke-StartupInstallerPrompt; Start-Scan; if($script:closeAfterScan){ $form.Close() } })
 
 $lv.Add_DoubleClick({ if($lv.SelectedItems.Count -gt 0){ Show-Details $lv.SelectedItems[0].Tag } })
 $lvR.Add_DoubleClick({ if($lvR.SelectedItems.Count -gt 0 -and @($lvR.SelectedItems[0].Tag.Paths).Count -gt 0){ Show-Details $lvR.SelectedItems[0].Tag } })
@@ -1174,6 +1751,16 @@ $btnClean.Add_Click({
     if($cv -and (Get-Process -Name 'claude' -EA SilentlyContinue)){
         $r=[System.Windows.Forms.MessageBox]::Show("Claude Desktop is running, so its VM cache can't be fully freed. Close Claude Desktop first for that item.`n`nContinue with the rest now?","Claude Desktop is open",'OKCancel','Warning')
         if($r -eq 'Cancel'){ return }
+    }
+    if($cbRestore.Checked){
+        $status.Text='Creating a System Restore point (this can take a minute)...'; $status.Refresh(); [System.Windows.Forms.Application]::DoEvents()
+        $form.Cursor='WaitCursor'; $rp=New-CleanRestorePoint; $form.Cursor='Default'
+        if($rp.Status -eq 'Created'){ $status.Text='Restore point created.' }
+        elseif($rp.Status -eq 'Skipped24h'){ [System.Windows.Forms.MessageBox]::Show($rp.Message,"Restore point",'OK','Information')|Out-Null }
+        else{
+            $r=[System.Windows.Forms.MessageBox]::Show("No restore point was created: $($rp.Message)`n`nClean WITHOUT a restore point?","Restore point",'YesNo','Warning')
+            if($r -ne 'Yes'){ $status.Text='Cleaning cancelled (no restore point).'; Write-CleanLog 'CLEAN cancelled: restore point not created and user declined'; return }
+        }
     }
     $btnClean.Enabled=$false; $btnAll.Enabled=$false; $btnNone.Enabled=$false; $btnRescan.Enabled=$false
     $script:cancelRequested=$false; $btnCancel.Enabled=$true; $btnCancel.Visible=$true; $btnClose.Visible=$false
@@ -1224,6 +1811,7 @@ $btnSec.Add_Click({
     $rep=$null
     try { $rep = Get-SecurityReport $prog } catch { Write-CleanLog "SECURITY CHECK ERROR: $($_.Exception.Message)" }
     if($rep){
+        $script:lastSecurity=$rep
         foreach($x in $rep.Items){
             $it=New-Object System.Windows.Forms.ListViewItem($x.Severity)
             $it.SubItems.Add($x.Type)|Out-Null; $it.SubItems.Add($x.Name)|Out-Null; $it.SubItems.Add([string]$x.PID)|Out-Null

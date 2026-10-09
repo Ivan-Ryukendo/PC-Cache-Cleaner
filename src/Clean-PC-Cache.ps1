@@ -1,6 +1,6 @@
 <#
 ================================================================================
-  Clean-PC-Cache.ps1  -  Generalized Windows 10/11 cache & temp cleaner  (v1.2.0)
+  Clean-PC-Cache.ps1  -  Generalized Windows 10/11 cache & temp cleaner  (v1.2.1)
 ================================================================================
   Safely deletes regenerable CACHE and TEMP data only. It NEVER touches:
     - Documents, downloads, or any personal files
@@ -23,6 +23,9 @@
     .\Clean-PC-Cache.ps1 -DryRun -AllDrives        # every fixed local drive
     .\Clean-PC-Cache.ps1 -SecurityCheck            # read-only suspicious process report
     .\Clean-PC-Cache.ps1 -ListProfiles             # list other user profiles (read-only)
+    .\Clean-PC-Cache.ps1 -CheckUpdate             # ask GitHub for newer Standard / Pro releases
+    .\Clean-PC-Cache.ps1 -DryRun -ExportReport C:\temp\report.html   # save the scan as HTML (or .csv)
+    .\Clean-PC-Cache.ps1 -RestorePoint            # create a System Restore point before cleaning
 
   PARAMETERS
     -Auto                 Run without any prompts (uses defaults + any -Include flags)
@@ -34,6 +37,12 @@
     -AllDrives            Scan every fixed local drive (removable/network/optical excluded)
     -SecurityCheck        Read-only list of suspicious processes/startup entries; deletes nothing
     -ListProfiles         List OTHER user profiles with sizes (read-only)
+    -CheckUpdate          Contact GitHub (only when you pass this) and report newer versions of
+                          this tool and of the free Pro edition; downloads/installs nothing
+    -RestorePoint         Create a System Restore point first (needs Administrator; Windows allows
+                          one per 24 h). If it fails, cleaning continues only after you confirm;
+                          with -Auto it is skipped instead (nothing deleted)
+    -ExportReport <path>  Save the scan results to .html or .csv (before any cleaning)
     -IncludeOtherProfiles Offer to delete other user profiles; each needs the profile name
                           typed to confirm. Ignored with -Auto or -DryRun.
 ================================================================================
@@ -49,11 +58,14 @@ param(
     [switch]$AllDrives,
     [switch]$SecurityCheck,
     [switch]$ListProfiles,
-    [switch]$IncludeOtherProfiles
+    [switch]$IncludeOtherProfiles,
+    [switch]$CheckUpdate,
+    [switch]$RestorePoint,
+    [string]$ExportReport
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
-$script:AppVersion = '1.2.0'
+$script:AppVersion = '1.2.1'
 $script:ScanCancel = $false
 
 # --- logging setup (next to the exe/script) ---
@@ -949,6 +961,368 @@ function Get-SecurityReport([scriptblock]$Progress){
     $sorted=@($items | Sort-Object @{e={$order[$_.Severity]}},Type,Name)
     return @{ Items=$sorted; Defender=(Get-DefenderInfo); Stats=[PSCustomObject]@{ Processes=$procs.Count; StartupEntries=$startup.Count; SignedAppDataStartup=$signedAppData } }
 }
+
+# ---------------------------------------------------------------- network helpers (update checker + downloader)
+# Used ONLY when the user asks (button / -CheckUpdate). No telemetry, no automatic calls.
+if (-not ('CleanFetch' -as [type])) {
+Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Threading;
+
+// Small GET on a background thread (short timeouts) so the UI never freezes.
+public class CleanFetch {
+    public volatile bool Done;
+    public int Status;
+    public string Body = "";
+    public string Error = "";
+    public void Start(string url, string ua, int timeoutMs) {
+        Done = false;
+        Thread t = new Thread(delegate() {
+            try {
+                HttpWebRequest rq = (HttpWebRequest)WebRequest.Create(url);
+                rq.UserAgent = ua; rq.Accept = "application/vnd.github+json";
+                rq.Timeout = timeoutMs; rq.ReadWriteTimeout = timeoutMs;
+                using (HttpWebResponse rs = (HttpWebResponse)rq.GetResponse()) {
+                    Status = (int)rs.StatusCode;
+                    using (StreamReader sr = new StreamReader(rs.GetResponseStream(), Encoding.UTF8)) { Body = sr.ReadToEnd(); }
+                }
+            } catch (WebException we) {
+                HttpWebResponse r = we.Response as HttpWebResponse;
+                if (r != null) { Status = (int)r.StatusCode; r.Close(); }
+                Error = we.Message;
+            } catch (Exception e) { Error = e.Message; }
+            Done = true;
+        });
+        t.IsBackground = true; t.Start();
+    }
+}
+
+// File download on a background thread with progress + cancel. Writes to 'dest' (caller passes a .part name).
+public class CleanDownloader {
+    public volatile bool Cancel;
+    public volatile bool Done;
+    public volatile bool Ok;
+    public long Total;
+    public long BytesDone;
+    public string Error = "";
+    public void Start(string url, string ua, string dest, int timeoutMs) {
+        Done = false; Ok = false; BytesDone = 0; Total = 0; Error = "";
+        Thread t = new Thread(delegate() {
+            FileStream fs = null;
+            try {
+                HttpWebRequest rq = (HttpWebRequest)WebRequest.Create(url);
+                rq.UserAgent = ua; rq.Accept = "application/octet-stream";
+                rq.Timeout = timeoutMs; rq.ReadWriteTimeout = timeoutMs; rq.AllowAutoRedirect = true;
+                using (HttpWebResponse rs = (HttpWebResponse)rq.GetResponse()) {
+                    Total = rs.ContentLength;
+                    using (Stream s = rs.GetResponseStream()) {
+                        fs = new FileStream(dest, FileMode.Create, FileAccess.Write, FileShare.None);
+                        byte[] buf = new byte[81920]; int n;
+                        while ((n = s.Read(buf, 0, buf.Length)) > 0) {
+                            if (Cancel) { Error = "cancelled"; break; }
+                            fs.Write(buf, 0, n); BytesDone += n;
+                        }
+                    }
+                }
+                fs.Close(); fs = null;
+                Ok = (!Cancel && Error.Length == 0);
+            } catch (Exception e) { Error = e.Message; }
+            finally { if (fs != null) { try { fs.Close(); } catch (Exception) { } } }
+            Done = true;
+        });
+        t.IsBackground = true; t.Start();
+    }
+}
+'@
+}
+
+# ---------------------------------------------------------------- update checker
+$script:RepoStd  = 'Ivan-Ryukendo/PC-Cache-Cleaner'
+$script:RepoPro  = 'Ivan-Ryukendo/PC-Cache-Cleaner-Pro'
+$script:ApiBase  = 'https://api.github.com/repos/'
+$script:MarkerPath = Join-Path $env:LOCALAPPDATA 'CleanPC\pending-delete.txt'
+
+function Enable-Tls12 { try { [Net.ServicePointManager]::SecurityProtocol = ([Net.ServicePointManager]::SecurityProtocol -bor 3072) } catch {} }
+
+# GET + parse JSON. Never throws. Returns Ok/Status/Data/Message. $Pump (optional) keeps a UI alive while waiting.
+function Invoke-GitHubJson([string]$url,[scriptblock]$Pump,[int]$TimeoutMs=8000){
+    $r=[PSCustomObject]@{ Ok=$false; Status=0; Data=$null; Message='' }
+    try{
+        Enable-Tls12
+        $f=New-Object CleanFetch
+        $f.Start($url,"CleanPC/$script:AppVersion",$TimeoutMs)
+        $sw=[Diagnostics.Stopwatch]::StartNew()
+        while(-not $f.Done){
+            if($Pump){ & $Pump }
+            Start-Sleep -Milliseconds 50
+            if($sw.ElapsedMilliseconds -gt ($TimeoutMs*2+2000)){ break }
+        }
+        if(-not $f.Done){ $r.Message='The request timed out.' }
+        else{
+            $r.Status=[int]$f.Status
+            if($r.Status -eq 200){ try{ $r.Data=($f.Body | ConvertFrom-Json); $r.Ok=$true }catch{ $r.Message='GitHub sent an unexpected reply.' } }
+            elseif($r.Status -eq 404){ $r.Message='Not found (404).' }
+            elseif($r.Status -eq 403 -or $r.Status -eq 429){ $r.Message='GitHub is limiting requests right now. Please try again later.' }
+            elseif($r.Status -gt 0){ $r.Message="GitHub answered with HTTP $($r.Status)." }
+            else{ $r.Message="Could not reach GitHub. Check your internet connection. ($($f.Error))" }
+        }
+    }catch{ $r.Message='The update check failed: ' + $_.Exception.Message }
+    Write-CleanLog ("UPDATE GET {0} -> ok={1} status={2} {3}" -f $url,$r.Ok,$r.Status,$r.Message)
+    return $r
+}
+
+# '1.2' / 'v1.2.1' / 'PC Cache Cleaner v1.2.1-beta' -> [version] 1.2.1 (3+ parts), or $null
+function ConvertTo-AppVersion([string]$s){
+    if(-not $s){ return $null }
+    $m=[regex]::Match($s,'(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?')
+    if(-not $m.Success){ return $null }
+    $p=@($m.Groups[1].Value,$m.Groups[2].Value,$(if($m.Groups[3].Success){$m.Groups[3].Value}else{'0'}))
+    if($m.Groups[4].Success){ $p += $m.Groups[4].Value }
+    try{ return [version]($p -join '.') }catch{ return $null }
+}
+
+# State: Newer | UpToDate | Available (Pro) | NotReleased | Error.  Never throws.
+function Get-UpdateInfo([string]$Channel,[string]$Repo,[string]$AssetName,[string]$CurrentVersion,[scriptblock]$Pump,[string]$ApiUrl){
+    $o=[PSCustomObject]@{ Channel=$Channel; State='Error'; Message=''; Tag=''; Version=$null; Notes=''; PageUrl=''; AssetName=$AssetName; AssetUrl=''; AssetSize=[int64]0; AssetSha256=''; Current=$CurrentVersion }
+    try{
+        if(-not $ApiUrl){ $ApiUrl = "$($script:ApiBase)$Repo/releases/latest" }
+        $r=Invoke-GitHubJson $ApiUrl $Pump
+        if($r.Status -eq 404){ $o.State='NotReleased'; $o.Message='No release has been published yet.'; return $o }
+        if(-not $r.Ok){ $o.Message=$r.Message; return $o }
+        $d=$r.Data
+        if($d.draft -or $d.prerelease){ $o.State='NotReleased'; $o.Message='Only a pre-release exists so far.'; return $o }
+        $o.Tag=[string]$d.tag_name; $o.PageUrl=[string]$d.html_url
+        $o.Version=ConvertTo-AppVersion $o.Tag
+        if(-not $o.Version){ $o.Message="Could not read the version number from the release tag '$($o.Tag)'."; return $o }
+        $n=[string]$d.body; if($n.Length -gt 700){ $n=$n.Substring(0,700).TrimEnd()+' ...' }
+        $o.Notes=($n -replace "`r","").Trim()
+        foreach($a in @($d.assets)){
+            if($a.name -ieq $AssetName){
+                $o.AssetUrl=[string]$a.browser_download_url; $o.AssetSize=[int64]$a.size
+                if($a.digest -and ([string]$a.digest) -match '^sha256:([0-9a-fA-F]{64})$'){ $o.AssetSha256=$Matches[1].ToLower() }
+            }
+        }
+        if($Channel -eq 'Pro'){
+            if(-not $o.AssetUrl){ $o.State='NotReleased'; $o.Message="The Pro release has no $AssetName file attached yet."; return $o }
+            $o.State='Available'; return $o
+        }
+        $cur=ConvertTo-AppVersion $CurrentVersion
+        if($cur -and $o.Version -gt $cur){ $o.State='Newer'; if(-not $o.AssetUrl){ $o.Message="The release has no $AssetName file attached; open the release page instead." } }
+        else{ $o.State='UpToDate' }
+    }catch{ $o.State='Error'; $o.Message='The update check failed: ' + $_.Exception.Message }
+    return $o
+}
+function Get-AllUpdateInfo([scriptblock]$Pump){
+    Write-CleanLog "UPDATE CHECK requested by user (current v$script:AppVersion)"
+    $std=Get-UpdateInfo 'Standard' $script:RepoStd 'CleanPC.exe' $script:AppVersion $Pump
+    $pro=Get-UpdateInfo 'Pro' $script:RepoPro 'CleanPC-Pro.exe' '' $Pump
+    Write-CleanLog ("UPDATE RESULT standard={0} ({1}) pro={2} ({3})" -f $std.State,$std.Tag,$pro.State,$pro.Tag)
+    return @{ Standard=$std; Pro=$pro }
+}
+
+# ---------------------------------------------------------------- download + installer housekeeping
+function Get-SelfPath{
+    try{ $p=[Diagnostics.Process]::GetCurrentProcess().MainModule.FileName; if($p -and ([IO.Path]::GetFileName($p) -notmatch '^(powershell|pwsh|powershell_ise)\.exe$')){ return $p } }catch{}
+    if($PSCommandPath){ return $PSCommandPath }
+    return $null
+}
+function Get-AppFolder{
+    $s=Get-SelfPath; if($s){ return (Split-Path -Parent $s) }
+    return $script:LogDir
+}
+# Free-space check: needs asset size + margin (50 MB or 10%, whichever is larger).
+function Test-DownloadSpace([string]$folder,[int64]$assetSize){
+    $res=[PSCustomObject]@{ Ok=$false; Free=[int64]0; Need=[int64]0; Message='' }
+    try{
+        $margin=[int64][Math]::Max([double]50MB,[Math]::Ceiling([double]$assetSize*0.1))
+        $res.Need=$assetSize+$margin
+        $root=[IO.Path]::GetPathRoot([IO.Path]::GetFullPath($folder))
+        if($root.StartsWith('\\')){ $res.Message='Network (UNC) folders cannot be checked for free space; choose a local drive.'; return $res }
+        $di=New-Object IO.DriveInfo $root
+        if($di.DriveType -ne 'Fixed'){ $res.Message="Drive $root is not a fixed local drive."; return $res }
+        $res.Free=[int64]$di.AvailableFreeSpace
+        if($res.Free -ge $res.Need){ $res.Ok=$true } else { $res.Message="Not enough free space on $root : $(Format-Size $res.Free) free, $(Format-Size $res.Need) needed." }
+    }catch{ $res.Message='Could not check free space: ' + $_.Exception.Message }
+    return $res
+}
+# Only github.com/Ivan-Ryukendo/... https links may be downloaded.
+function Test-AllowedDownloadUrl([string]$u){ return [bool]($u -match '^https://github\.com/Ivan-Ryukendo/[A-Za-z0-9._-]+/releases/download/') }
+# Finishes a download: size check, optional SHA-256 check, then moves .part -> final name.
+function Complete-Download([string]$part,[string]$final,[int64]$expectedSize,[string]$sha256,[bool]$overwrite){
+    $r=[PSCustomObject]@{ Ok=$false; Message='' }
+    try{
+        $len=(Get-Item -LiteralPath $part -Force -EA Stop).Length
+        if($expectedSize -gt 0 -and $len -ne $expectedSize){ $r.Message="Size mismatch: got $len bytes, expected $expectedSize. The partial file was deleted."; Remove-Item -LiteralPath $part -Force -EA SilentlyContinue; return $r }
+        if($sha256){
+            $h=(Get-FileHash -LiteralPath $part -Algorithm SHA256 -EA Stop).Hash.ToLower()
+            if($h -ne $sha256.ToLower()){ $r.Message='SHA-256 checksum mismatch. The partial file was deleted.'; Remove-Item -LiteralPath $part -Force -EA SilentlyContinue; return $r }
+        }
+        if((Test-Path -LiteralPath $final) -and -not $overwrite){ $r.Message='The target file already exists.'; return $r }
+        Move-Item -LiteralPath $part -Destination $final -Force -EA Stop
+        $r.Ok=$true; $r.Message="Saved to $final"
+    }catch{ $r.Message='Could not finish the download: ' + $_.Exception.Message }
+    Write-CleanLog ("DOWNLOAD finish ok={0} {1} :: {2}" -f $r.Ok,$final,$r.Message)
+    return $r
+}
+
+# The ONLY delete this program does outside caches: the one old installer .exe it came from.
+function Test-SafeInstallerDelete([string]$path,[string]$newFile,[string]$running,[switch]$RequireOurName){
+    $r=[PSCustomObject]@{ Ok=$false; Why='' }
+    try{
+        if([string]::IsNullOrWhiteSpace($path)){ $r.Why='no path'; return $r }
+        if($path -match '[\*\?<>|"]'){ $r.Why='wildcard or invalid characters'; return $r }
+        $full=[IO.Path]::GetFullPath($path)
+        if($full.Length -lt 8 -or [IO.Path]::GetPathRoot($full) -eq $full){ $r.Why='not a file path'; return $r }
+        if([IO.Path]::GetExtension($full) -ine '.exe'){ $r.Why='not an .exe file'; return $r }
+        if(-not (Test-Path -LiteralPath $full -PathType Leaf)){ $r.Why='file does not exist (or is a folder)'; return $r }
+        $fi=Get-Item -LiteralPath $full -Force
+        if($fi.PSIsContainer -or ($fi.Attributes -band [IO.FileAttributes]::ReparsePoint)){ $r.Why='folder or link'; return $r }
+        if($newFile -and ($full -ieq [IO.Path]::GetFullPath($newFile))){ $r.Why='this is the NEW file'; return $r }
+        if($running -and ($full -ieq [IO.Path]::GetFullPath($running))){ $r.Why='this is the program that is running right now'; return $r }
+        foreach($bad in @($env:SystemRoot,$env:ProgramFiles,${env:ProgramFiles(x86)},$env:ProgramW6432)){
+            if($bad -and $full.StartsWith($bad.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)){ $r.Why="inside $bad"; return $r }
+        }
+        if($RequireOurName -and ([IO.Path]::GetFileName($full) -notmatch '^CleanPC.*\.exe$')){ $r.Why='file name is not CleanPC*.exe'; return $r }
+        $r.Ok=$true
+    }catch{ $r.Why=$_.Exception.Message }
+    return $r
+}
+function Write-PendingDelete([string]$oldPath,[string]$oldVersion,[string]$newFile){
+    try{
+        $dir=Split-Path -Parent $script:MarkerPath
+        if(-not (Test-Path -LiteralPath $dir)){ New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Set-Content -LiteralPath $script:MarkerPath -Encoding UTF8 -Value @("old=$oldPath","oldversion=$oldVersion","new=$newFile","utc=$((Get-Date).ToUniversalTime().ToString('s'))")
+        Write-CleanLog "MARKER written: delete old installer $oldPath (v$oldVersion) after upgrade to $newFile"
+        return $true
+    }catch{ Write-CleanLog "MARKER write failed: $($_.Exception.Message)"; return $false }
+}
+function Clear-PendingDelete{ try{ Remove-Item -LiteralPath $script:MarkerPath -Force -EA SilentlyContinue }catch{} }
+# New-version startup: returns {Old;OldVersion;New} when the user should be asked once, else $null.
+function Get-PendingDelete{
+    try{
+        if(-not (Test-Path -LiteralPath $script:MarkerPath -PathType Leaf)){ return $null }
+        $m=@{}; foreach($l in @(Get-Content -LiteralPath $script:MarkerPath -EA Stop)){ if($l -match '^([a-z]+)=(.*)$'){ $m[$Matches[1]]=$Matches[2] } }
+        if(-not $m['old'] -or -not (Test-Path -LiteralPath $m['old'] -PathType Leaf)){ Clear-PendingDelete; return $null }   # already gone
+        $self=Get-SelfPath
+        if(-not $self -or -not $m['new'] -or ($self -ine $m['new'])){ return $null }                                      # not the new version (yet)
+        $ov=ConvertTo-AppVersion $m['oldversion']; $cv=ConvertTo-AppVersion $script:AppVersion
+        $isPro = ([IO.Path]::GetFileName($self) -match 'Pro')
+        if($ov -and $cv -and -not $isPro -and $ov -ge $cv){ Clear-PendingDelete; return $null }
+        $chk=Test-SafeInstallerDelete $m['old'] $self $self -RequireOurName
+        if(-not $chk.Ok){ Write-CleanLog "MARKER ignored ($($chk.Why)): $($m['old'])"; Clear-PendingDelete; return $null }
+        return [PSCustomObject]@{ Old=$m['old']; OldVersion=$m['oldversion']; New=$self }
+    }catch{ return $null }
+}
+function Remove-OldInstaller([string]$oldPath,[string]$newFile,[string]$running,[switch]$RequireOurName){
+    $chk=Test-SafeInstallerDelete $oldPath $newFile $running -RequireOurName:$RequireOurName
+    if(-not $chk.Ok){ Write-CleanLog "OLD INSTALLER delete REFUSED ($($chk.Why)): $oldPath"; return $false }
+    try{
+        Remove-Item -LiteralPath $oldPath -Force -EA Stop
+        Write-CleanLog "OLD INSTALLER deleted (user chose Delete): $oldPath"
+        return $true
+    }catch{ Write-CleanLog "OLD INSTALLER delete failed $oldPath : $($_.Exception.Message)"; return $false }
+}
+# A running exe cannot delete itself: start a tiny hidden cmd that retries deleting that ONE file until
+# this program has exited (up to ~10 minutes). Same safety checks as above.
+function Start-DeferredDelete([string]$oldPath,[string]$newFile){
+    $chk=Test-SafeInstallerDelete $oldPath $newFile $null
+    if(-not $chk.Ok){ Write-CleanLog "DEFERRED delete REFUSED ($($chk.Why)): $oldPath"; return $false }
+    if($oldPath -match '[%&^!]'){ Write-CleanLog "DEFERRED delete REFUSED (special characters in path): $oldPath"; return $false }
+    try{
+        $cl = 'for /l %i in (1,1,600) do @if exist "{0}" (del /f /q "{0}" >nul 2>&1 & ping -n 2 127.0.0.1 >nul)' -f $oldPath
+        Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList @('/d','/c',$cl) -WindowStyle Hidden
+        Write-CleanLog "DEFERRED delete scheduled (runs after this program exits): $oldPath"
+        return $true
+    }catch{ Write-CleanLog "DEFERRED delete failed to start: $($_.Exception.Message)"; return $false }
+}
+
+# ---------------------------------------------------------------- restore point
+function Test-RestoreDisabled{
+    try{
+        $pol=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore' -EA SilentlyContinue
+        if($pol -and $pol.DisableSR -eq 1){ return $true }
+        $vs=@(& vssadmin.exe list shadowstorage 2>$null)
+        if($vs.Count -gt 0 -and ($vs -join "`n") -match 'For volume'){ return (($vs -join "`n") -notmatch ("\(" + [regex]::Escape($env:SystemDrive) + "\)")) }
+    }catch{}
+    return $false
+}
+function Get-LastRestoreSeq{ try{ $m=(Get-ComputerRestorePoint -EA Stop | Measure-Object SequenceNumber -Maximum).Maximum; if($m){ return [int]$m } }catch{}; return 0 }
+# Status: Created | Skipped24h | Disabled | NotAdmin | Failed.  Never throws; Windows allows 1 per 24 h by default.
+function New-CleanRestorePoint{
+    $r=[PSCustomObject]@{ Status='Failed'; Message='' }
+    try{
+        if(-not (Is-Admin)){ $r.Status='NotAdmin'; $r.Message='Creating a restore point needs Administrator rights.'; return $r }
+        if(Test-RestoreDisabled){ $r.Status='Disabled'; $r.Message='System Restore appears to be turned off for the Windows drive.'; return $r }
+        $before=Get-LastRestoreSeq
+        $wv=$null
+        Checkpoint-Computer -Description "PC Cache Cleaner $script:AppVersion" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop -WarningVariable wv -WarningAction SilentlyContinue
+        $after=Get-LastRestoreSeq
+        $w=(@($wv) | ForEach-Object { [string]$_ }) -join ' '
+        if($after -gt $before){ $r.Status='Created'; $r.Message='Restore point created.' }
+        elseif($w -match '1440|already been created|within the past'){ $r.Status='Skipped24h'; $r.Message='Windows allows one restore point per 24 hours and one was already created recently; the existing one still protects you.' }
+        elseif($w -match 'disabled|turned off'){ $r.Status='Disabled'; $r.Message='System Restore is turned off.' }
+        else{ $r.Status='Failed'; $r.Message=$(if($w){$w}else{'Windows did not create a restore point.'}) }
+    }catch{
+        $msg=$_.Exception.Message
+        if($msg -match 'disabled|turned off'){ $r.Status='Disabled'; $r.Message='System Restore is turned off.' }
+        elseif($msg -match '1440|already been created|within the past'){ $r.Status='Skipped24h'; $r.Message='Windows allows one restore point per 24 hours and one was already created recently.' }
+        else{ $r.Status='Failed'; $r.Message=$msg }
+    }
+    Write-CleanLog ("RESTORE POINT status={0} {1}" -f $r.Status,$r.Message)
+    return $r
+}
+
+# ---------------------------------------------------------------- report export (HTML / CSV)
+# $Cleanup rows need: Name Category Size Paths Note Ticked.  $Report rows: Name Size Paths Note.  $Security: result of Get-SecurityReport or $null.
+function Get-RiskLabel($note){ if([string]$note -like 'RISKY*'){ return 'Risky' } else { return 'Normal' } }
+function ConvertTo-CsvCell([string]$s){
+    if($s -match '^[=+\-@\t]'){ $s = "'" + $s }          # neutralise spreadsheet formulas
+    return '"' + ($s -replace '"','""') + '"'
+}
+function Export-CleanReport([string]$Path,[string]$Format,$Cleanup,$Report,$Security,[string[]]$Drives){
+    $res=[PSCustomObject]@{ Ok=$false; Message='' }
+    try{
+        if(-not $Format){ $Format = $(if([IO.Path]::GetExtension($Path) -ieq '.csv'){'csv'}else{'html'}) }
+        $Cleanup=@($Cleanup); $Report=@($Report)
+        $gen=Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $tick=[int64]0; foreach($c in $Cleanup){ if($c.Ticked){ $tick += [int64]$c.Size } }
+        if($Format -eq 'csv'){
+            $sb=New-Object System.Text.StringBuilder
+            [void]$sb.AppendLine('Section,Name,Category,SizeBytes,Size,Ticked,Risk,Note,Paths')
+            foreach($c in $Cleanup){ [void]$sb.AppendLine((@('Cleanup',$c.Name,$c.Category,[string][int64]$c.Size,(Format-Size $c.Size),$(if($c.Ticked){'yes'}else{'no'}),(Get-RiskLabel $c.Note),$c.Note,(@($c.Paths) -join ' | ')) | ForEach-Object { ConvertTo-CsvCell ([string]$_) }) -join ',') }
+            foreach($c in $Report){ [void]$sb.AppendLine((@('Report only',$c.Name,'Report',[string][int64]$c.Size,(Format-Size $c.Size),'no','Report only',$c.Note,(@($c.Paths) -join ' | ')) | ForEach-Object { ConvertTo-CsvCell ([string]$_) }) -join ',') }
+            if($Security){ foreach($x in @($Security.Items)){ [void]$sb.AppendLine((@('Security',$x.Name,$x.Type,'','','no',$x.Severity,$x.Reasons,$x.Path) | ForEach-Object { ConvertTo-CsvCell ([string]$_) }) -join ',') } }
+            [IO.File]::WriteAllText($Path,$sb.ToString(),(New-Object System.Text.UTF8Encoding($true)))
+        } else {
+            $e={ param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
+            $h=New-Object System.Text.StringBuilder
+            [void]$h.AppendLine('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>PC Cache Cleaner report</title>')
+            [void]$h.AppendLine('<style>body{font:14px Segoe UI,Arial,sans-serif;margin:24px;color:#222}h1{font-size:20px}h2{font-size:16px;margin-top:28px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:5px 8px;text-align:left;vertical-align:top}th{background:#f0f0f0}td.n{text-align:right;white-space:nowrap}.risk{color:#a00;font-weight:600}.paths{font:12px Consolas,monospace;color:#444;word-break:break-all}.meta{color:#555}</style></head><body>')
+            [void]$h.AppendLine("<h1>PC Cache Cleaner report</h1><p class=""meta"">Generated $(& $e $gen) by v$(& $e $script:AppVersion). Drives: $(& $e ($Drives -join ', ')). Ticked total: <b>$(& $e (Format-Size $tick))</b>. Nothing in this report has been deleted by exporting it.</p>")
+            [void]$h.AppendLine('<h2>Cleanup items</h2><table><tr><th>Ticked</th><th>Item</th><th>Category</th><th>Size</th><th>Risk</th><th>Note</th><th>Paths</th></tr>')
+            foreach($c in $Cleanup){ [void]$h.AppendLine("<tr><td>$(if($c.Ticked){'yes'}else{'no'})</td><td>$(& $e $c.Name)</td><td>$(& $e $c.Category)</td><td class=""n"">$(& $e (Format-Size $c.Size))</td><td class=""$(if((Get-RiskLabel $c.Note) -eq 'Risky'){'risk'})"">$(Get-RiskLabel $c.Note)</td><td>$(& $e $c.Note)</td><td class=""paths"">$(& $e (@($c.Paths) -join ' | '))</td></tr>") }
+            [void]$h.AppendLine('</table>')
+            if($Report.Count -gt 0){
+                [void]$h.AppendLine('<h2>Report only (this tool never deletes these)</h2><table><tr><th>Item</th><th>Size</th><th>How to deal with it</th><th>Location</th></tr>')
+                foreach($c in $Report){ [void]$h.AppendLine("<tr><td>$(& $e $c.Name)</td><td class=""n"">$(& $e (Format-Size $c.Size))</td><td>$(& $e $c.Note)</td><td class=""paths"">$(& $e (@($c.Paths) -join ' | '))</td></tr>") }
+                [void]$h.AppendLine('</table>')
+            }
+            if($Security){
+                [void]$h.AppendLine("<h2>Security check (heuristic: suspicious, review - not confirmed malware)</h2><p class=""meta"">$(@($Security.Items).Count) item(s) flagged.</p><table><tr><th>Level</th><th>Type</th><th>Name</th><th>Why</th><th>Path</th></tr>")
+                foreach($x in @($Security.Items)){ [void]$h.AppendLine("<tr><td>$(& $e $x.Severity)</td><td>$(& $e $x.Type)</td><td>$(& $e $x.Name)</td><td>$(& $e $x.Reasons)</td><td class=""paths"">$(& $e $x.Path)</td></tr>") }
+                [void]$h.AppendLine('</table>')
+            }
+            [void]$h.AppendLine('</body></html>')
+            [IO.File]::WriteAllText($Path,$h.ToString(),(New-Object System.Text.UTF8Encoding($false)))
+        }
+        $res.Ok=$true; $res.Message="Report saved to $Path"
+    }catch{ $res.Message='Could not save the report: ' + $_.Exception.Message }
+    Write-CleanLog ("REPORT EXPORT ok={0} {1} :: {2}" -f $res.Ok,$Path,$res.Message)
+    return $res
+}
 #endregion CORE
 
 # ================================================================ console
@@ -967,10 +1341,30 @@ trap {
 try { Clear-Host } catch {}
 Write-Host "================================================================" -ForegroundColor White
 Write-Host "  Windows Cache & Temp Cleaner v$script:AppVersion" -ForegroundColor White
-$mode = if($SecurityCheck){'SECURITY CHECK (read-only)'}elseif($ListProfiles){'LIST PROFILES (read-only)'}elseif($DryRun){'DRY RUN (nothing deleted)'}elseif($Auto){'Auto'}else{'Interactive'}
+$mode = if($CheckUpdate){'CHECK FOR UPDATES'}elseif($SecurityCheck){'SECURITY CHECK (read-only)'}elseif($ListProfiles){'LIST PROFILES (read-only)'}elseif($DryRun){'DRY RUN (nothing deleted)'}elseif($Auto){'Auto'}else{'Interactive'}
 Write-Host "  Mode: $mode   Admin: $(Is-Admin)" -ForegroundColor White
 Write-Host "================================================================" -ForegroundColor White
 Write-CleanLog ("=== Run start (console v$script:AppVersion) === admin=$(Is-Admin) os=$([System.Environment]::OSVersion.Version) host=$([System.Environment]::MachineName) dryrun=$DryRun mode=$mode")
+
+# ---------------------------------------------------------------- update check (only when asked)
+if($CheckUpdate){
+    Section "Update check (contacts api.github.com because you asked; nothing is downloaded)"
+    $all = Get-AllUpdateInfo $null
+    $sx = $all.Standard
+    switch($sx.State){
+        'Newer'    { Write-Host ("   Standard: {0} is available (you have v{1}).  {2}" -f $sx.Tag,$script:AppVersion,$sx.PageUrl) -ForegroundColor Green }
+        'UpToDate' { Write-Host ("   Standard: up to date (latest {0}, you have v{1})." -f $sx.Tag,$script:AppVersion) -ForegroundColor Gray }
+        default    { Write-Host ("   Standard: could not check - {0}" -f $sx.Message) -ForegroundColor Yellow }
+    }
+    $px = $all.Pro
+    switch($px.State){
+        'Available'   { Write-Host ("   Upgrade to Pro (free): {0} is available - a separate, fuller-featured app.  {1}" -f $px.Tag,$px.PageUrl) -ForegroundColor Green }
+        'NotReleased' { Write-Host "   Pro edition not released yet." -ForegroundColor Gray }
+        default       { Write-Host ("   Pro: could not check - {0}" -f $px.Message) -ForegroundColor Yellow }
+    }
+    Write-Host "   Download from the release page (or use the GUI's Check for updates, which verifies the file)." -ForegroundColor DarkGray
+    return
+}
 
 # ---------------------------------------------------------------- security check (read-only)
 if($SecurityCheck){
@@ -989,6 +1383,7 @@ if($SecurityCheck){
     if($d.Available){ Write-Host ("Defender: real-time={0} service={1} definitions={2} day(s) old, last full scan: {3}" -f $d.Realtime,$d.AMService,$d.SigAgeDays,$(if($d.LastFullScan){$d.LastFullScan}else{'unknown'})) }
     foreach($a in $d.Advice){ Write-Host "  * $a" -ForegroundColor Yellow }
     Write-Host "Results are heuristics, not proof of malware." -ForegroundColor DarkGray
+    if($ExportReport){ $er = Export-CleanReport $ExportReport '' @() @() $rep @(); Write-Host ("   {0}" -f $er.Message) -ForegroundColor $(if($er.Ok){'Green'}else{'Yellow'}) }
     return
 }
 
@@ -1041,12 +1436,30 @@ if(@($res.Report).Count -gt 0){
     }
 }
 
+# ---------------------------------------------------------------- export report (before any cleaning)
+if($ExportReport){
+    $selNames = @{}; foreach($t in $sel){ $selNames[$t.Name] = 1 }
+    $cl = @(); foreach($t in $targets){ $cl += [PSCustomObject]@{ Name=$t.Name; Category=$t.Category; Size=$t.Size; Paths=$t.Paths; Note=$t.Note; Ticked=[bool]$selNames.ContainsKey($t.Name) } }
+    $er = Export-CleanReport $ExportReport '' $cl @($res.Report) $null $driveList
+    Write-Host ("`n   {0}" -f $er.Message) -ForegroundColor $(if($er.Ok){'Green'}else{'Yellow'})
+}
+
 # ---------------------------------------------------------------- clean
 $totalSel = [int64]0; foreach($t in $sel){ $totalSel += [int64]$t.Size }
 $freed = [int64]0
 if($DryRun){
     Write-Host "`n   DRY RUN - nothing was deleted." -ForegroundColor Yellow
 } else {
+    if($RestorePoint){
+        Section "System Restore point"
+        $rp = New-CleanRestorePoint
+        Write-Host ("   {0}: {1}" -f $rp.Status,$rp.Message) -ForegroundColor $(if($rp.Status -in 'Created','Skipped24h'){'Green'}else{'Yellow'})
+        if($rp.Status -notin 'Created','Skipped24h'){
+            $go = $false
+            if(-not $Auto){ $go = ((Read-Host "   Clean WITHOUT a restore point? (y/N)") -match '^(y|yes)$') }
+            if(-not $go){ Write-Host "   Cleaning skipped (no restore point). Nothing was deleted." -ForegroundColor Yellow; Write-CleanLog 'CLEAN skipped: restore point not created'; $sel.Clear() }
+        }
+    }
     Section "Cleaning"
     if(($sel | Where-Object { $_.Name -like 'Claude*' }) -and (Get-Process -Name 'claude' -ErrorAction SilentlyContinue)){
         Write-Host "   NOTE: Claude Desktop appears to be running - locked files will be skipped." -ForegroundColor DarkYellow
